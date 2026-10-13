@@ -1,0 +1,193 @@
+"""
+REST API домена risk — сквозная база рисков (ТЗ v13).
+
+CRUD + поиск (используется LLM как источник обоснований) + импорт из risk_matrices.
+Чтение доступно всем аутентифицированным; запись — QUALITY_MANAGER/ADMIN
+(в DEMO_MODE deps возвращает ADMIN, поэтому работает без логина).
+"""
+from __future__ import annotations
+
+import uuid
+from datetime import date
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.database import get_db
+from app.modules.iam import get_current_user, require_permission
+from app.modules.reporting import RiskMatrix  # кросс-доменное чтение через фасад reporting
+from app.modules.risk import service
+from app.modules.risk.models import RiskBase
+from app.modules.risk.schemas import RiskBaseCreate, RiskBaseOut, RiskBaseUpdate, TriggeredRiskOut
+
+router = APIRouter()
+
+
+@router.get("", response_model=list[RiskBaseOut])
+async def list_risks(
+    category: str | None = None,
+    characteristic: str | None = None,
+    severity: str | None = None,
+    status: str = "active",
+    q: str | None = None,
+    limit: int = Query(1000, ge=1, le=10000),  # ДЕФ-24: потолок выборки
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risks")),
+) -> list[RiskBase]:
+    stmt = select(RiskBase)
+    if status != "all":
+        stmt = stmt.where(RiskBase.status == status)
+    if category:
+        stmt = stmt.where(RiskBase.category == category)
+    if characteristic:
+        stmt = stmt.where(RiskBase.characteristic == characteristic)
+    if severity:
+        stmt = stmt.where(RiskBase.severity == severity)
+    if q:
+        like = f"%{q.lower()}%"
+        stmt = stmt.where(or_(
+            RiskBase.title.ilike(like),
+            RiskBase.description.ilike(like),
+            RiskBase.keywords.ilike(like),
+            RiskBase.code.ilike(like),
+        ))
+    stmt = stmt.order_by(RiskBase.created_at.desc()).limit(limit)
+    return list((await db.execute(stmt)).scalars().all())
+
+
+@router.get("/search", response_model=list[RiskBaseOut])
+async def search_risks(
+    q: str = Query(..., min_length=2),
+    limit: int = 5,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risks")),
+) -> list[RiskBase]:
+    """Лексический поиск для LLM-grounding (по тексту/ключевым словам). Оставлен неизменным."""
+    return await service.search_risks(db, q, limit)
+
+
+@router.get("/semantic-search", response_model=list[RiskBaseOut])
+async def semantic_search_risks(
+    q: str = Query(..., min_length=2),
+    limit: int = 5,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risks")),
+) -> list[RiskBase]:
+    """Семантический поиск базы рисков (T-20): косинусная близость эмбеддингов через pgvector.
+    Находит риск по смыслу/морфологии, а не только по точному вхождению слова (в отличие от
+    /search и ?q=). Если эмбеддинги ещё не проставлены — честный откат на лексический поиск."""
+    return await service.semantic_search_risks(db, q, limit)
+
+
+@router.get("/triggered", response_model=list[TriggeredRiskOut])
+async def get_triggered_risks(
+    system: str | None = None,
+    characteristics: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.dashboard.risk_radar", "view.dashboard.risk", "view.dashboard.cto")),
+) -> list[TriggeredRiskOut]:
+    """Риск-триггеры (T-16) — см. docstring `service.triggered_risks` (ТЗ v21, КП-40: логика
+    вынесена в сервисный слой, переиспользуется агрегатором кокпита)."""
+    return await service.triggered_risks(db, system=system, characteristics=characteristics)
+
+
+@router.post("", response_model=RiskBaseOut, status_code=201)
+async def create_risk(
+    payload: RiskBaseCreate,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_permission("risk.base.edit")),
+) -> RiskBase:
+    exists = (await db.execute(
+        select(RiskBase).where(RiskBase.code == payload.code)
+    )).scalar_one_or_none()
+    if exists:
+        raise HTTPException(status_code=409, detail=f"Код риска уже существует: {payload.code}")
+    risk = RiskBase(**payload.model_dump(), created_by=user.get("username"))
+    risk.embedding = service.embed_risk(risk)  # T-20: индексируем карточку сразу при создании
+    db.add(risk)
+    await db.commit()
+    await db.refresh(risk)
+    return risk
+
+
+@router.patch("/{risk_id}", response_model=RiskBaseOut)
+async def update_risk(
+    risk_id: uuid.UUID,
+    payload: RiskBaseUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.base.edit")),
+) -> RiskBase:
+    risk = await db.get(RiskBase, risk_id)
+    if risk is None:
+        raise HTTPException(status_code=404, detail="Риск не найден")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(risk, field, value)
+    risk.embedding = service.embed_risk(risk)  # T-20: текст мог измениться — пересчитываем вектор
+    await db.commit()
+    await db.refresh(risk)
+    return risk
+
+
+@router.post("/{risk_id}/archive", response_model=RiskBaseOut)
+async def archive_risk(
+    risk_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.base.edit")),
+) -> RiskBase:
+    risk = await db.get(RiskBase, risk_id)
+    if risk is None:
+        raise HTTPException(status_code=404, detail="Риск не найден")
+    risk.status = "archived"
+    await db.commit()
+    await db.refresh(risk)
+    return risk
+
+
+@router.post("/import/{period_id}", response_model=dict)
+async def import_from_period(
+    period_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_permission("risk.base.edit")),
+) -> dict:
+    """Перенос рисков периода (risk_matrices) в накопительную базу. Дубли по коду пропускаются."""
+    rows = list((await db.execute(
+        select(RiskMatrix).where(RiskMatrix.period_id == period_id)
+    )).scalars().all())
+    existing_codes = set((await db.execute(select(RiskBase.code))).scalars().all())
+    imported = 0
+    today = date.today().strftime("%Y%m%d")
+    for r in rows:
+        code = f"R-IMP-{today}-{r.id}"
+        if code in existing_codes:
+            continue
+        risk = RiskBase(
+            code=code,
+            title=(r.risk_description or "Риск")[:120],
+            category=r.characteristic or "общее",
+            characteristic=r.characteristic,
+            subcharacteristic=r.subcharacteristic,
+            description=r.risk_description,
+            consequence=r.risk_consequence,
+            mitigation=r.mitigation_measures,
+            source="excel",
+            created_by=user.get("username"),
+        )
+        risk.embedding = service.embed_risk(risk)  # T-20: импортированные карточки тоже индексируем
+        db.add(risk)
+        existing_codes.add(code)
+        imported += 1
+    await db.commit()
+    return {"imported": imported, "skipped": len(rows) - imported}
+
+
+@router.post("/reembed", response_model=dict)
+async def reembed_risks(
+    only_missing: bool = False,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.reembed")),
+) -> dict:
+    """Бэкфилл эмбеддингов базы рисков (T-20). only_missing=true — только строки без вектора
+    (после первого разворачивания фичи); иначе пересчёт всех (после смены провайдера)."""
+    count = await service.reembed_all(db, only_missing=only_missing)
+    return {"reembedded": count}

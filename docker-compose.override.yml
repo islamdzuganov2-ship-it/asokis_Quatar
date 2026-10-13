@@ -1,0 +1,25 @@
+# docker-compose.override.yml — локальные override'ы (подхватываются `docker compose` автоматически).
+#
+# LLM МОДЕЛЬ-АГНОСТИЧНА. Положите ЛЮБОЙ *.gguf в models/llm/ — система сама его подхватит:
+#   • LOCAL_LLM_MODEL_FILE=auto        → автоподбор новейшего файла;
+#   • LOCAL_LLM_MODEL_FILE=<имя.gguf>  → закрепить конкретную модель (как ниже).
+# Сейчас закреплена Gemma 3 12B (arch gemma3) — грузится рантаймом llama-cpp-python>=0.3.
+# NB: 12B на CPU отвечает медленно; для скорости используйте GPU: docker-compose.gpu.yml.
+#
+# ПЕРЕКЛЮЧЕНИЕ МОДЕЛИ (без пересборки образа):
+#   1) скопировать новый *.gguf в models/llm/ (и при желании поменять имя ниже, либо auto);
+#   2) `docker compose restart backend celery_worker`  (или POST /api/v1/reports/llm-reload — ADMIN);
+#   3) проверить: GET /api/v1/reports/llm-status (имя/архитектура), GET /api/v1/reports/llm-models.
+# Пересборка нужна ОДИН раз — под обновлённый рантайм 0.3.x: `docker compose build backend celery_worker`.
+services:
+  backend:
+    # Автоперезагрузка кода (RES-08) ВЫКЛЮЧЕНА намеренно: при резидентной модели каждый
+    # рестарт воркера заново грузит ~7 ГБ весов — замер показал ~10 минут ожидания на
+    # первом же запросе. Именно это выглядело как «утечка памяти».
+    # Включать ТОЛЬКО когда LLM_ENABLED=false (правка кода без модели):
+    # command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - LOCAL_LLM_MODEL_FILE=gemma-3-12b-it-Q4_K_M.gguf
+  celery_worker:
+    environment:
+      - LOCAL_LLM_MODEL_FILE=gemma-3-12b-it-Q4_K_M.gguf

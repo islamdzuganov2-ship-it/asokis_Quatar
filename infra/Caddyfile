@@ -1,0 +1,19 @@
+# Прямой веб-сервер вашего ПК для домена asokis.ai (без туннеля/прокси в трафике).
+# Caddy сам получает бесплатный TLS-сертификат Let's Encrypt (HTTP-01), поэтому
+# обязателен реальный доступ из интернета к портам 80 и 443 этого ПК
+# и A-запись asokis.ai → ваш публичный IP в режиме DNS-only (серое облако Cloudflare).
+
+asokis.ai, www.asokis.ai {
+    encode zstd gzip
+    # ИБ-13 (SEC-06): заголовки безопасности на периметре. HSTS — только здесь, где есть TLS;
+    # CSP и прочие приходят от Vite/бэкенда (Caddy их не перетирает — оператор «?» = по умолчанию).
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        ?X-Content-Type-Options "nosniff"
+        ?X-Frame-Options "DENY"
+        ?Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+    # Весь трафик → фронтенд (Vite), который сам проксирует /api на бэкенд.
+    reverse_proxy frontend:3000
+}

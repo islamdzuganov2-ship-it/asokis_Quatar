@@ -1,0 +1,641 @@
+"""
+Логика рискового события (BL-007, RE-08/09): CRUD числового риска, графовые связи и пересчёт ALE.
+
+RE-08: риск с числовым ARO, связи M:N (подхарактеристика / ТС / мера). RE-09: ALE = ARO × SLE по
+привязанным реализациям (ТС) через экономический движок. Кросс-доменные зависимости — только через
+фасады: incidents (реализации), governance (меры), econ (движок и C_ТС).
+"""
+from __future__ import annotations
+
+import uuid
+from collections import defaultdict
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.econ import annual_loss_expectancy, compute_incident_cost, config_value
+from app.modules.governance import STATUS_APPROVED, Proposal
+from app.modules.incidents import TechIncident
+from app.modules.risk.event_schemas import (
+    AleResultOut,
+    HeatmapCellDetailOut,
+    HeatmapCellSubcharOut,
+    HeatmapCellMeasureOut,
+    HeatmapCellRiskOut,
+    HeatmapMoneyCellOut,
+    IncidentLinkDetailOut,
+    MeasureLinkDetailOut,
+    MeasureLinkIn,
+    PortfolioRiskSummaryOut,
+    RiskEventCreate,
+    RiskEventLinksOut,
+    RiskEventUpdate,
+    RiskMeasureChainMeasureOut,
+    RiskMeasureChainRowOut,
+    SubcharLinkIn,
+    SubcharLinkOut,
+)
+from app.modules.risk.models import (
+    RISK_EVENT_ACTIVE,
+    RISK_EVENT_ARCHIVED,
+    RiskEvent,
+    RiskEventIncident,
+    RiskEventMeasure,
+    RiskEventSubchar,
+)
+from app.modules.systems import System
+from app.shared.exceptions import ConflictError, NotFoundError
+
+
+# ═══════════════════════ CRUD ═══════════════════════
+
+async def list_events(db: AsyncSession, *, status: str = "active", system_id: uuid.UUID | None = None,
+                      category: str | None = None) -> list[RiskEvent]:
+    stmt = select(RiskEvent)
+    if status != "all":
+        stmt = stmt.where(RiskEvent.status == status)
+    if system_id is not None:
+        stmt = stmt.where(RiskEvent.system_id == system_id)
+    if category:
+        stmt = stmt.where(RiskEvent.category == category)
+    return list((await db.execute(stmt.order_by(RiskEvent.created_at.desc()))).scalars().all())
+
+
+async def get_or_404(db: AsyncSession, event_id: uuid.UUID) -> RiskEvent:
+    ev = await db.get(RiskEvent, event_id)
+    if ev is None:
+        raise NotFoundError("Рисковое событие не найдено")
+    return ev
+
+
+async def create_event(db: AsyncSession, data: RiskEventCreate, username: str | None) -> RiskEvent:
+    dup = (await db.execute(select(RiskEvent).where(RiskEvent.code == data.code))).scalar_one_or_none()
+    if dup is not None:
+        raise ConflictError(f"Рисковое событие с кодом {data.code} уже существует")
+    ev = RiskEvent(**data.model_dump(exclude_none=True), created_by=username)
+    db.add(ev)
+    await db.commit()
+    await db.refresh(ev)
+    return ev
+
+
+async def update_event(db: AsyncSession, ev: RiskEvent, data: RiskEventUpdate) -> RiskEvent:
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(ev, field, value)
+    await db.commit()
+    await db.refresh(ev)
+    return ev
+
+
+async def archive_event(db: AsyncSession, ev: RiskEvent) -> RiskEvent:
+    ev.status = RISK_EVENT_ARCHIVED
+    await db.commit()
+    await db.refresh(ev)
+    return ev
+
+
+# ═══════════════════════ Связи (M:N) ═══════════════════════
+
+async def link_subchar(db: AsyncSession, event_id: uuid.UUID, data: SubcharLinkIn) -> RiskEventSubchar:
+    await get_or_404(db, event_id)
+    dup = (await db.execute(select(RiskEventSubchar).where(
+        RiskEventSubchar.risk_event_id == event_id,
+        RiskEventSubchar.characteristic == data.characteristic,
+        RiskEventSubchar.subcharacteristic == data.subcharacteristic,
+    ))).scalar_one_or_none()
+    if dup is not None:
+        raise ConflictError("Подхарактеристика уже связана с этим риском")
+    link = RiskEventSubchar(risk_event_id=event_id, characteristic=data.characteristic,
+                            subcharacteristic=data.subcharacteristic)
+    db.add(link)
+    await db.commit()
+    await db.refresh(link)
+    return link
+
+
+async def link_incident(db: AsyncSession, event_id: uuid.UUID, incident_id: uuid.UUID) -> RiskEventIncident:
+    await get_or_404(db, event_id)
+    if await db.get(TechIncident, incident_id) is None:
+        raise NotFoundError("Технический сбой не найден")
+    dup = (await db.execute(select(RiskEventIncident).where(
+        RiskEventIncident.risk_event_id == event_id,
+        RiskEventIncident.incident_id == incident_id,
+    ))).scalar_one_or_none()
+    if dup is not None:
+        raise ConflictError("Этот техсбой уже привязан к риску")
+    link = RiskEventIncident(risk_event_id=event_id, incident_id=incident_id)
+    db.add(link)
+    await db.commit()
+    await db.refresh(link)
+    return link
+
+
+async def link_measure(db: AsyncSession, event_id: uuid.UUID, data: MeasureLinkIn) -> RiskEventMeasure:
+    await get_or_404(db, event_id)
+    if await db.get(Proposal, data.proposal_id) is None:
+        raise NotFoundError("Мера (proposal) не найдена")
+    dup = (await db.execute(select(RiskEventMeasure).where(
+        RiskEventMeasure.risk_event_id == event_id,
+        RiskEventMeasure.proposal_id == data.proposal_id,
+    ))).scalar_one_or_none()
+    if dup is not None:
+        raise ConflictError("Эта мера уже привязана к риску")
+    link = RiskEventMeasure(risk_event_id=event_id, proposal_id=data.proposal_id,
+                            ale_reduction_share=data.ale_reduction_share)
+    db.add(link)
+    await db.commit()
+    await db.refresh(link)
+    return link
+
+
+async def linked_incidents(db: AsyncSession, event_id: uuid.UUID) -> list[TechIncident]:
+    ids = (await db.execute(select(RiskEventIncident.incident_id).where(
+        RiskEventIncident.risk_event_id == event_id,
+    ))).scalars().all()
+    if not ids:
+        return []
+    return list((await db.execute(select(TechIncident).where(TechIncident.id.in_(ids)))).scalars().all())
+
+
+async def get_links(db: AsyncSession, event_id: uuid.UUID) -> RiskEventLinksOut:
+    """Карточка взаимосвязи ТС-мера-экономика-качество (БТ-322) — все три связи риска одним
+    запросом каждая, с деталями для отображения (не голыми id)."""
+    await get_or_404(db, event_id)
+
+    subchar_rows = (await db.execute(select(RiskEventSubchar).where(
+        RiskEventSubchar.risk_event_id == event_id,
+    ))).scalars().all()
+
+    incident_rows = (await db.execute(
+        select(RiskEventIncident, TechIncident)
+        .join(TechIncident, TechIncident.id == RiskEventIncident.incident_id)
+        .where(RiskEventIncident.risk_event_id == event_id)
+    )).all()
+
+    measure_rows = (await db.execute(
+        select(RiskEventMeasure, Proposal)
+        .join(Proposal, Proposal.id == RiskEventMeasure.proposal_id)
+        .where(RiskEventMeasure.risk_event_id == event_id)
+    )).all()
+
+    return RiskEventLinksOut(
+        subchars=[SubcharLinkOut.model_validate(s) for s in subchar_rows],
+        incidents=[
+            IncidentLinkDetailOut(
+                id=link.id, incident_id=inc.id, title=inc.title, system_name=inc.system_name,
+                occurred_at=inc.occurred_at,
+                cost_total=float(inc.cost_total) if inc.cost_total is not None else None,
+            )
+            for link, inc in incident_rows
+        ],
+        measures=[
+            MeasureLinkDetailOut(
+                id=link.id, proposal_id=p.id, title=p.risk_title or p.metric_name or "Мера",
+                status=p.status,
+                ale_reduction_share=float(link.ale_reduction_share) if link.ale_reduction_share is not None else None,
+            )
+            for link, p in measure_rows
+        ],
+    )
+
+
+async def unlink_subchar(db: AsyncSession, event_id: uuid.UUID, link_id: uuid.UUID) -> None:
+    link = await db.get(RiskEventSubchar, link_id)
+    if link is None or link.risk_event_id != event_id:
+        raise NotFoundError("Связь с подхарактеристикой не найдена")
+    await db.delete(link)
+    await db.commit()
+
+
+async def unlink_incident(db: AsyncSession, event_id: uuid.UUID, link_id: uuid.UUID) -> None:
+    link = await db.get(RiskEventIncident, link_id)
+    if link is None or link.risk_event_id != event_id:
+        raise NotFoundError("Связь с техсбоем не найдена")
+    await db.delete(link)
+    await db.commit()
+
+
+async def unlink_measure(db: AsyncSession, event_id: uuid.UUID, link_id: uuid.UUID) -> None:
+    link = await db.get(RiskEventMeasure, link_id)
+    if link is None or link.risk_event_id != event_id:
+        raise NotFoundError("Связь с мерой не найдена")
+    await db.delete(link)
+    await db.commit()
+
+
+# ═══════════════════════ Пересчёт ALE (RE-09) ═══════════════════════
+
+def _percentile(values: list[float], p: float) -> float | None:
+    """Линейно-интерполированный перцентиль выборки (для ALE_P90)."""
+    if not values:
+        return None
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * p / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return round(s[lo] + (s[hi] - s[lo]) * (k - lo), 2)
+
+
+async def recompute_ale(db: AsyncSession, ev: RiskEvent) -> AleResultOut:
+    """ALE = ARO × SLE по привязанным реализациям (§2.3). SLE — средний C_ТС; ARO — по числу ТС за
+    окно ITSM (или экспертный, если задан). Считаем три величины: средний / P90 / MaxSLE — иначе
+    Mission Critical систематически недооценивается."""
+    incidents = await linked_incidents(db, ev.id)
+
+    # Стоимость каждой реализации (C_ТС): из кэша incident.cost_total либо считаем движком.
+    costs: list[float] = []
+    for inc in incidents:
+        value = inc.cost_total
+        if value is None:
+            value = await compute_incident_cost(db, inc)  # выставит inc.cost_total
+        if value is not None and float(value) > 0:
+            costs.append(float(value))
+
+    # ARO: экспертный (если задан) либо частота = число ТС / окно наблюдения (мес истории ITSM).
+    if ev.aro_is_expert and ev.aro is not None:
+        aro: float | None = float(ev.aro)
+    else:
+        window_months = float(await config_value(db, "itsm_history_months", 12) or 12)
+        window_years = max(window_months / 12.0, 1e-9)
+        aro = round(len(incidents) / window_years, 4)
+
+    # SLE: средний C_ТС по реализациям, иначе экспертная оценка риска.
+    if costs:
+        sle_avg = round(sum(costs) / len(costs), 2)
+        max_sle = max(costs)
+        sle_p90 = _percentile(costs, 90) if len(costs) >= 3 else None
+    else:
+        sle_avg = float(ev.sle_expert) if ev.sle_expert is not None else 0.0
+        max_sle = float(ev.sle_expert) if ev.sle_expert is not None else None
+        sle_p90 = None
+
+    result = annual_loss_expectancy(aro or 0.0, sle_avg, sle_p90, max_sle)
+    prev_ale = float(ev.ale_avg) if ev.ale_avg is not None else 0.0
+    ev.ale_avg = result.ale_avg
+    ev.ale_p90 = result.ale_p90
+    ev.max_sle = result.max_sle
+    if not ev.aro_is_expert:
+        ev.aro = aro
+    await db.commit()
+    await db.refresh(ev)
+    await _notify_threshold_crossed(db, ev, prev_ale)
+
+    return AleResultOut(
+        risk_event_id=ev.id, aro=aro, incidents_counted=len(incidents), incidents_costed=len(costs),
+        ale_avg=result.ale_avg, ale_p90=result.ale_p90, max_sle=result.max_sle,
+    )
+
+
+_APPETITE_KEY_BY_CRITICALITY = {
+    "MISSION CRITICAL": "Mission Critical",
+    "BUSINESS CRITICAL": "Business Critical",
+    "BUSINESS OPERATIONAL": "Support",
+}
+
+
+async def risk_appetite_of(db: AsyncSession, ev: RiskEvent) -> float | None:
+    """Риск-аппетит риска: заданный на самом риске, иначе по классу критичности его ИС (§3.2)."""
+    if ev.risk_appetite is not None:
+        return float(ev.risk_appetite)
+    if ev.system_id is None:
+        return None
+    system = await db.get(System, ev.system_id)
+    crit = getattr(getattr(system, "criticality_class", None), "value", None)
+    key = _APPETITE_KEY_BY_CRITICALITY.get(crit or "")
+    by_class = await config_value(db, "risk_appetite_by_class", {}) or {}
+    value = by_class.get(key) if key else None
+    return float(value) if value is not None else None
+
+
+async def _notify_threshold_crossed(db: AsyncSession, ev: RiskEvent, prev_ale: float) -> None:
+    """УК-15, событие «риск превысил порог»: только при ПЕРЕХОДЕ через риск-аппетит снизу вверх —
+    риск, давно стоящий выше аппетита, не должен слать письмо на каждый пересчёт."""
+    appetite = await risk_appetite_of(db, ev)
+    new_ale = float(ev.ale_avg or 0)
+    if appetite is None or not (prev_ale <= appetite < new_ale):
+        return
+    from app.modules.notifications import emit
+    from app.shared.notification_events import EVENT_RISK_THRESHOLD_EXCEEDED
+    from app.shared.money import fmt_rub
+
+    system = await db.get(System, ev.system_id) if ev.system_id else None
+    await emit(
+        db, EVENT_RISK_THRESHOLD_EXCEEDED, ev.owner, entity_type="risk_event", entity_id=str(ev.id),
+        title=ev.title, system=system.name if system else "портфель",
+        ale=fmt_rub(new_ale) + "/год", appetite=fmt_rub(appetite) + "/год",
+    )
+
+
+# ═══════════════ Ячейка теплокарты: баллы × риски × меры × деньги (ТЗ v19 п.4, УК-10) ═══════════════
+
+async def _characteristics_per_risk(db: AsyncSession, risk_ids) -> dict[uuid.UUID, int]:
+    """Сколько РАЗНЫХ характеристик у риска — делитель его ALE между ячейками (В-14: поровну)."""
+    if not risk_ids:
+        return {}
+    rows = (await db.execute(
+        select(RiskEventSubchar.risk_event_id, RiskEventSubchar.characteristic)
+        .where(RiskEventSubchar.risk_event_id.in_(list(risk_ids)))
+    )).all()
+    chars: dict[uuid.UUID, set[str]] = defaultdict(set)
+    for rid, ch in rows:
+        chars[rid].add(ch)
+    return {rid: max(len(c), 1) for rid, c in chars.items()}
+
+
+async def _subchar_scores(db: AsyncSession, system_id, characteristic: str):
+    """Баллы подхарактеристик характеристики за последний период ИС (УК-10)."""
+    from app.modules.assessment import AssessmentPeriod, AssessmentValue
+    from app.modules.quality import QUALITY_MODEL, MetricCatalog, canonical_characteristic
+    from app.shared.periods import period_sort_key
+
+    periods = (await db.execute(
+        select(AssessmentPeriod.id, AssessmentPeriod.period).where(AssessmentPeriod.system_id == system_id)
+    )).all()
+    subs_def = next((subs for title, subs in QUALITY_MODEL if title == characteristic), [])
+    if not periods:
+        return None, [HeatmapCellSubcharOut(name=sub) for sub, _ in subs_def]
+    period_id, label = max(periods, key=lambda r: period_sort_key(r[1]))
+    values = (await db.execute(
+        select(AssessmentValue, MetricCatalog)
+        .join(MetricCatalog, AssessmentValue.metric_id == MetricCatalog.id)
+        .where(AssessmentValue.period_id == period_id)
+    )).all()
+    by_sub: dict[str, HeatmapCellSubcharOut] = {}
+    for value, metric in values:
+        if canonical_characteristic(metric.characteristic) != characteristic:
+            continue
+        if value.unmeasurable:
+            by_sub[metric.subcharacteristic] = HeatmapCellSubcharOut(name=metric.subcharacteristic, unmeasurable=True)
+        elif value.calculated_x is not None:
+            by_sub[metric.subcharacteristic] = HeatmapCellSubcharOut(
+                name=metric.subcharacteristic, score=round(float(value.calculated_x) * 100))
+    ordered = [by_sub.get(sub, HeatmapCellSubcharOut(name=sub)) for sub, _ in subs_def]
+    ordered += [s for name, s in by_sub.items() if name not in {sub for sub, _ in subs_def}]
+    return label, ordered
+
+async def cell_detail(db: AsyncSession, system_name: str, characteristic: str) -> HeatmapCellDetailOut:
+    """Риски этой ИС, привязанные к этой характеристике (через RiskEventSubchar), с их деньгами
+    (ALE) и привязанными мерами. system_name, не system_id: управленческий дашборд (источник
+    клика по ячейке) в LIVE-режиме работает именами ИС — ExecutiveDashboard.tsx строит свои данные
+    из /reports/executive-dashboard, где есть только yAxisLabels (имена), настоящий system_id туда
+    не прокидывается. Система не найдена / рисков нет → пустой список, не ошибка (карточка ИС
+    показывает «риски не заведены», это нормальное состояние на пилоте, не сбой)."""
+    system = (await db.execute(select(System).where(System.name == system_name))).scalar_one_or_none()
+    if system is None:
+        return HeatmapCellDetailOut(system_name=system_name, characteristic=characteristic, total_ale=0.0, risks=[])
+    period_label, subchars = await _subchar_scores(db, system.id, characteristic)
+
+    rows = (await db.execute(
+        select(RiskEvent, RiskEventSubchar.subcharacteristic)
+        .join(RiskEventSubchar, RiskEventSubchar.risk_event_id == RiskEvent.id)
+        .where(
+            RiskEvent.system_id == system.id,
+            RiskEvent.status == RISK_EVENT_ACTIVE,
+            RiskEventSubchar.characteristic == characteristic,
+        )
+    )).all()
+
+    risks_by_id: dict[uuid.UUID, RiskEvent] = {}
+    subchars_by_risk: dict[uuid.UUID, set[str]] = defaultdict(set)
+    for ev, subchar in rows:
+        risks_by_id[ev.id] = ev
+        subchars_by_risk[ev.id].add(subchar)
+
+    n_chars = await _characteristics_per_risk(db, risks_by_id.keys())
+    in_cell = {rid: float(ev.ale_avg or 0) / n_chars.get(rid, 1) for rid, ev in risks_by_id.items()}
+    measures_by_risk: dict[uuid.UUID, list[HeatmapCellMeasureOut]] = defaultdict(list)
+    if risks_by_id:
+        m_rows = (await db.execute(
+            select(RiskEventMeasure, Proposal)
+            .join(Proposal, Proposal.id == RiskEventMeasure.proposal_id)
+            .where(RiskEventMeasure.risk_event_id.in_(risks_by_id.keys()))
+        )).all()
+        for link, proposal in m_rows:
+            share = float(link.ale_reduction_share) if link.ale_reduction_share is not None else None
+            measures_by_risk[link.risk_event_id].append(HeatmapCellMeasureOut(
+                proposal_id=proposal.id,
+                title=proposal.risk_title or proposal.metric_name or "Мера",
+                status=proposal.status,
+                ale_reduction_share=share,
+                delta_ale=round(in_cell[link.risk_event_id] * share, 2) if share is not None else None,
+                rosi=float(proposal.rosi) if proposal.rosi is not None else None,
+                verdict=proposal.verdict,
+            ))
+
+    risks_out = [
+        HeatmapCellRiskOut(
+            id=ev.id, code=ev.code, title=ev.title,
+            ale_avg=float(ev.ale_avg) if ev.ale_avg is not None else None,
+            ale_p90=float(ev.ale_p90) if ev.ale_p90 is not None else None,
+            ale_in_cell=round(in_cell[ev.id], 2),
+            characteristics_count=n_chars.get(ev.id, 1),
+            status=ev.status,
+            subcharacteristics=sorted(subchars_by_risk[ev.id]),
+            measures=measures_by_risk.get(ev.id, []),
+        )
+        for ev in risks_by_id.values()
+    ]
+    risks_out.sort(key=lambda r: r.ale_in_cell or 0, reverse=True)
+    total_ale = round(sum(r.ale_in_cell or 0 for r in risks_out), 2)
+    # Σ долей снятия по риску ограничена 1: две меры по 60% не снимают 120% риска.
+    total_delta = round(sum(
+        (r.ale_in_cell or 0) * min(1.0, sum(m.ale_reduction_share or 0 for m in r.measures))
+        for r in risks_out
+    ), 2)
+
+    return HeatmapCellDetailOut(
+        system_name=system.name, characteristic=characteristic, total_ale=total_ale,
+        total_delta_ale=total_delta, period=period_label, subcharacteristics=subchars, risks=risks_out,
+    )
+
+
+async def heatmap_money_layer(db: AsyncSession) -> list[HeatmapMoneyCellOut]:
+    """УК-11: денежный слой ВСЕЙ теплокарты за один запрос — та же агрегация, что cell_detail(),
+    по всем ячейкам (ИС × характеристика) сразу вместо N×M отдельных вызовов на весь грид.
+
+    Риск, привязанный к подхарактеристикам n разных характеристик (RiskEventSubchar допускает M:N),
+    входит в каждую ячейку долей 1/n (В-14: поровну) — сумма по ячейкам ИС сходится с ALE ИС
+    (критерий УК-10), мера не удваивает эффект в двух ячейках."""
+    rows = (await db.execute(
+        select(RiskEvent, RiskEventSubchar.characteristic, System.name)
+        .join(RiskEventSubchar, RiskEventSubchar.risk_event_id == RiskEvent.id)
+        .join(System, System.id == RiskEvent.system_id)
+        .where(RiskEvent.status == RISK_EVENT_ACTIVE)
+    )).all()
+
+    # Дедуп риска в рамках ОДНОЙ ячейки — риск, привязанный к нескольким подхарактеристикам
+    # ОДНОЙ характеристики, не должен удваивать свой ALE (тот же принцип, что risks_by_id выше).
+    cell_risks: dict[tuple[str, str], dict[uuid.UUID, RiskEvent]] = defaultdict(dict)
+    for ev, characteristic, system_name in rows:
+        cell_risks[(system_name, characteristic)][ev.id] = ev
+
+    if not cell_risks:
+        return []
+
+    all_risk_ids = {ev.id for risks in cell_risks.values() for ev in risks.values()}
+    measure_links = (await db.execute(
+        select(RiskEventMeasure).where(RiskEventMeasure.risk_event_id.in_(all_risk_ids))
+    )).scalars().all()
+    shares_by_risk: dict[uuid.UUID, list[float]] = defaultdict(list)
+    for link in measure_links:
+        shares_by_risk[link.risk_event_id].append(
+            float(link.ale_reduction_share) if link.ale_reduction_share is not None else 0.0
+        )
+
+    n_chars = await _characteristics_per_risk(db, all_risk_ids)
+
+    def in_cell(ev: RiskEvent) -> float:
+        return float(ev.ale_avg or 0) / n_chars.get(ev.id, 1)
+
+    out: list[HeatmapMoneyCellOut] = []
+    for (system_name, characteristic), risks in cell_risks.items():
+        total_ale = sum(in_cell(ev) for ev in risks.values())
+        total_delta_ale = sum(
+            in_cell(ev) * min(1.0, sum(shares_by_risk.get(ev.id, []))) for ev in risks.values()
+        )
+        covered_ale = sum(in_cell(ev) for ev in risks.values() if shares_by_risk.get(ev.id))
+        coverage_pct = round(covered_ale / total_ale * 100, 1) if total_ale > 0 else 0.0
+        out.append(HeatmapMoneyCellOut(
+            system_name=system_name, characteristic=characteristic,
+            total_ale=round(total_ale, 2), total_delta_ale=round(total_delta_ale, 2),
+            coverage_pct=coverage_pct,
+        ))
+    return out
+
+
+# ── ТЗ v19 п.7 (УК-19/20): сквозная цепочка риск → мера → эффект + портфельный итог ──
+
+def _payback_months(p: Proposal) -> float | None:
+    """Срок окупаемости в месяцах — только по «живым деньгам» (delta_ale_cash): deferred и
+    capacity не возвращаются в бюджет, окупаемость на них не считается. None — не молчаливый 0,
+    а честное «не окупается / нет данных» (нет capex, нет эффекта, или чистый эффект ≤ 0)."""
+    if not p.capex or p.delta_ale_cash is None:
+        return None
+    net_monthly = float(p.delta_ale_cash) / 12.0 - float(p.opex_per_year or 0) / 12.0
+    if net_monthly <= 0:
+        return None
+    return round(float(p.capex) / net_monthly, 1)
+
+
+async def risk_measure_chain(db: AsyncSession) -> list[RiskMeasureChainRowOut]:
+    """УК-19: одна таблица сквозной цепочки риск → мера → эффект, по всем активным рискам сразу
+    (не по одной ИС/характеристике, как cell_detail/heatmap_money_layer — это управленческий
+    экран уровня портфеля, не теплокарты)."""
+    risk_rows = (await db.execute(
+        select(RiskEvent, System.name)
+        .outerjoin(System, System.id == RiskEvent.system_id)
+        .where(RiskEvent.status == RISK_EVENT_ACTIVE)
+        .order_by(RiskEvent.ale_avg.desc().nullslast())
+    )).all()
+    if not risk_rows:
+        return []
+
+    risk_ids = [ev.id for ev, _ in risk_rows]
+    measure_rows = (await db.execute(
+        select(RiskEventMeasure, Proposal)
+        .join(Proposal, Proposal.id == RiskEventMeasure.proposal_id)
+        .where(RiskEventMeasure.risk_event_id.in_(risk_ids))
+    )).all()
+    measures_by_risk: dict[uuid.UUID, list[RiskMeasureChainMeasureOut]] = defaultdict(list)
+    for link, proposal in measure_rows:
+        measures_by_risk[link.risk_event_id].append(RiskMeasureChainMeasureOut(
+            proposal_id=proposal.id,
+            title=proposal.risk_title or proposal.metric_name or "Мера",
+            status=proposal.status,
+            execution=proposal.execution,
+            capex=float(proposal.capex) if proposal.capex is not None else None,
+            opex_per_year=float(proposal.opex_per_year) if proposal.opex_per_year is not None else None,
+            ale_reduction_share=float(link.ale_reduction_share) if link.ale_reduction_share is not None else None,
+            delta_ale_cash=float(proposal.delta_ale_cash) if proposal.delta_ale_cash is not None else None,
+            delta_ale_deferred=float(proposal.delta_ale_deferred) if proposal.delta_ale_deferred is not None else None,
+            delta_ale_capacity=float(proposal.delta_ale_capacity) if proposal.delta_ale_capacity is not None else None,
+            rosi=float(proposal.rosi) if proposal.rosi is not None else None,
+            verdict=proposal.verdict,
+            payback_months=_payback_months(proposal),
+        ))
+
+    return [
+        RiskMeasureChainRowOut(
+            risk_id=ev.id, risk_code=ev.code, risk_title=ev.title, system_name=sys_name,
+            ale_avg=float(ev.ale_avg) if ev.ale_avg is not None else None,
+            measures=measures_by_risk.get(ev.id, []),
+        )
+        for ev, sys_name in risk_rows
+    ]
+
+
+async def portfolio_risk_summary(
+    db: AsyncSession, *,
+    system_id: list[uuid.UUID] | None = None,
+    criticality: list[str] | None = None,
+    characteristic: str | None = None,
+) -> PortfolioRiskSummaryOut:
+    """УК-20: «под риском / покрыто выполненными мерами / остаточный / вложения / ожидаемый
+    эффект». covered_by_done_measures — ТОЛЬКО execution=DONE (см. докстринг PortfolioRiskSummaryOut);
+    expected_effect — одобренные, но ещё не выполненные (эффект в будущем, не в прошлом).
+    Сквозной разрез (ТЗ v21 §10.4): без параметров поведение не меняется (КП-ПР-7)."""
+    stmt = select(RiskEvent).where(RiskEvent.status == RISK_EVENT_ACTIVE)
+    if system_id is not None:
+        stmt = stmt.where(RiskEvent.system_id.in_(system_id))
+    risks = list((await db.execute(stmt)).scalars().all())
+
+    if criticality is not None:
+        systems = (await db.execute(select(System))).scalars().all()
+        crit_ids = {s.id for s in systems if s.criticality_class.value in criticality}
+        risks = [r for r in risks if r.system_id in crit_ids]
+    if characteristic is not None:
+        subchars = (await db.execute(select(RiskEventSubchar))).scalars().all()
+        char_event_ids = {sc.risk_event_id for sc in subchars if sc.characteristic == characteristic}
+        risks = [r for r in risks if r.id in char_event_ids]
+
+    total_at_risk = round(sum(float(r.ale_avg or 0) for r in risks), 2)
+    if not risks:
+        return PortfolioRiskSummaryOut(
+            total_at_risk=0.0, covered_by_done_measures=0.0, residual_risk=0.0,
+            required_investment=0.0, expected_effect=0.0, risks_count=0, measures_count=0,
+        )
+
+    ale_by_risk = {r.id: float(r.ale_avg or 0) for r in risks}
+    measure_rows = (await db.execute(
+        select(RiskEventMeasure, Proposal)
+        .join(Proposal, Proposal.id == RiskEventMeasure.proposal_id)
+        .where(RiskEventMeasure.risk_event_id.in_(ale_by_risk.keys()), Proposal.status == STATUS_APPROVED)
+    )).all()
+
+    covered = 0.0
+    covered_elim = 0.0
+    covered_comp = 0.0
+    expected = 0.0
+    investment = 0.0
+    seen_proposals: set[uuid.UUID] = set()
+    for link, proposal in measure_rows:
+        share = float(link.ale_reduction_share or 0)
+        effect = ale_by_risk.get(link.risk_event_id, 0.0) * share
+        if proposal.execution == "DONE":
+            covered += effect
+            if proposal.measure_type == "COMPENSATING":
+                covered_comp += effect
+            else:
+                covered_elim += effect
+        else:
+            expected += effect
+        if proposal.id not in seen_proposals:
+            # CAPEX/OPEX принадлежат МЕРЕ, не связи риск↔мера — считаем один раз на меру,
+            # даже если она закрывает несколько рисков (иначе задвоили бы вложения).
+            seen_proposals.add(proposal.id)
+            investment += float(proposal.capex or 0) + float(proposal.opex_per_year or 0)
+
+    return PortfolioRiskSummaryOut(
+        total_at_risk=total_at_risk,
+        covered_by_done_measures=round(covered, 2),
+        residual_risk=round(total_at_risk - covered, 2),
+        required_investment=round(investment, 2),
+        expected_effect=round(expected, 2),
+        risks_count=len(risks),
+        measures_count=len(seen_proposals),
+        covered_by_eliminating=round(covered_elim, 2),
+        covered_by_compensating=round(covered_comp, 2),
+        residual_with_compensating_only=round(total_at_risk - covered_comp, 2),
+    )

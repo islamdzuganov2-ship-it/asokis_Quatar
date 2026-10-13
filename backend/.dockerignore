@@ -1,0 +1,17 @@
+# Не включаем в образ данные/артефакты — сборка от них не зависит, файлы можно свободно удалять.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.env
+# Excel-файлы и каталоги данных (автосид опционален и пропускается, если их нет)
+*.xlsx
+*.xlsm
+seed_data/
+uploads/
+# ИБ-02: демо-учётки и демо-сиды с открытыми паролями в продуктивный образ не попадают.
+# Демо-стенд монтирует исходники (bind-mount ./backend:/app), поэтому там они есть.
+app/modules/iam/demo_users.py
+app/scripts/seed_demo.py
+app/scripts/seed_korp_quality.py
+app/scripts/seed_scale.py
