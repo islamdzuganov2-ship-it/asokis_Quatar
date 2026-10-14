@@ -15,7 +15,7 @@
  *
  * Запуск: npm run check:size   (ненулевой код возврата = есть нарушения)
  */
-import { globSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,9 +40,13 @@ const SIZE_BUDGET_KB = {
   'pages/ExcelReportsPage.tsx': 29,
 };
 
-const sources = globSync('**/*.{ts,tsx}', { cwd: SRC })
+// Recursive readdirSync is available in Node.js 20 used by CI; fs.globSync is not.
+const sources = readdirSync(SRC, { recursive: true })
   .map((p) => p.replace(/\\/g, '/'))
-  .filter((p) => !p.includes('__tests__'));
+  .filter((p) => /\.tsx?$/.test(p) && !p.includes('__tests__'))
+  .filter((p) => !p.split('/').some((part) => part.startsWith('.')))
+  .filter((p) => statSync(resolve(SRC, p)).isFile())
+  .sort();
 
 /** Размер в LF-нормализованном виде: иначе один и тот же файл на Windows-чекауте (CRLF)
  *  оказывается на ~1 КБ «тяжелее», чем в репозитории и на CI, и проверка зависит от ОС. */
