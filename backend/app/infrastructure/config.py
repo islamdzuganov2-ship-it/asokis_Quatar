@@ -1,0 +1,197 @@
+"""
+Конфигурация приложения. Все значения берутся из .env / переменных окружения.
+
+Каноническое место (ТЗ v13, infrastructure). Обратная совместимость: app.core.config
+ре-экспортирует settings/Settings отсюда (shim), пока ссылки не переведены.
+"""
+from pydantic_settings import BaseSettings
+from typing import List
+from pydantic import ConfigDict
+import os
+
+class Settings(BaseSettings):
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",          # ← ключевое: игнорировать лишние переменные окружения
+        case_sensitive=False,
+    )
+
+    # Основное
+    PROJECT_NAME: str = "АСОК ИС"
+
+    # База данных
+    DATABASE_URL: str = "postgresql+asyncpg://asok_user:asok_pass123@postgres:5432/asok_is"
+
+    # JWT
+    JWT_SECRET_KEY: str = "dev_secret_key_change_in_production_minimum_32_chars"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # Redis / Celery. ИБ-05/ИБ-22 (SEC-10): Redis с паролем (requirepass в docker-compose.yml);
+    # пароль берётся из REDIS_PASSWORD в .env и подставляется в REDIS_URL самим compose.
+    # Значение по умолчанию ниже — только для запуска вне Docker; в проде без пароля старт запрещён.
+    REDIS_URL: str = "redis://redis:6379/0"
+
+    # ИБ-09: логирование. LOG_FORMAT=json — для SIEM, text — для чтения глазами на стенде.
+    LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: str = "json"
+
+    # ИБ-10: анти-брутфорс входа (см. iam/throttle.py).
+    LOGIN_MAX_FAILURES: int = 5              # неудач на пару «логин + IP» за окно
+    LOGIN_MAX_FAILURES_PER_USER: int = 10    # неудач на логин с любых адресов за окно
+    LOGIN_FAILURE_WINDOW_S: int = 900        # окно подсчёта, 15 минут
+    LOGIN_LOCKOUT_S: int = 900               # первая блокировка; каждая следующая за сутки — ×2
+
+    # ИБ-08/ИБ-10: реальный IP клиента берётся из X-Forwarded-For только от этих адресов
+    # (прокси Vite/Caddy/туннеля внутри docker-сети). Иначе IP подделывается одним заголовком.
+    TRUSTED_PROXIES: List[str] = ["127.0.0.1/32", "::1/128", "172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
+
+    # ИБ-13: HSTS выставляется только для HTTPS-запросов; флаг — чтобы выключить на стенде,
+    # где HTTPS терминирует чужой прокси с собственной политикой.
+    SECURITY_HSTS_ENABLED: bool = True
+
+    # LLM (in-process, llama.cpp / GGUF — без внешних сервисов).
+    # МОДЕЛЬ-АГНОСТИЧНО: система принимает ЛЮБУЮ GGUF-модель, положенную в LOCAL_LLM_MODEL_DIR,
+    # опрашивает её метаданные (архитектура, окно контекста, шаблон чата) и адаптируется.
+    # LOCAL_LLM_MODEL_FILE="auto" → автоподбор файла из папки (новейший *.gguf); можно задать
+    # конкретное имя, чтобы закрепить модель. Рантайм llama-cpp-python>=0.3 грузит современные
+    # архитектуры (qwen2/qwen3, llama, gemma2, phi3, mistral и др.).
+    LLM_ENABLED: bool = True
+    LOCAL_LLM_MODEL_DIR: str = "models/llm"
+    LOCAL_LLM_MODEL_FILE: str = "auto"   # "auto" → автоподбор; либо явное имя файла .gguf
+    LLM_N_CTX: int = 4096                 # верхняя граница; фактически ограничивается окном модели
+    LLM_N_THREADS: int = 8               # потоки CPU (крупные модели — больше)
+    LLM_N_GPU_LAYERS: int = 0            # 0 = CPU; -1 = все слои на GPU (нужна CUDA/Metal-сборка)
+    LLM_MAX_TOKENS: int = 320
+    LLM_TEMPERATURE: float = 0.1         # максимум детерминизма/честности
+    LLM_TOP_P: float = 0.9
+    LLM_CHAT_FORMAT: str = "auto"        # "auto" → шаблон чата из GGUF; иначе явный формат llama.cpp
+
+    # Ресурсные ограничители инференса (RES-03/RES-05, ДЕФ-04).
+    # LLM_WARMUP — грузить модель в фоне при старте. Без прогрева первый же запрос платил за
+    # холодную загрузку весов: замер на стенде — 120 с таймаута (фактически ~10 минут) на
+    # управленческом дашборде, повторный вызов 0.45 с.
+    LLM_WARMUP: bool = True
+    # Сколько ждать освобождения модели, прежде чем честно отказать. llama.cpp не потокобезопасен,
+    # вызовы сериализуются; без потолка очередь росла неограниченно и выедала пул потоков
+    # asyncio.to_thread, блокируя и обычные, не-LLM эндпоинты.
+    LLM_QUEUE_TIMEOUT_S: float = 20.0
+    # Максимум ОДНОВРЕМЕННО ожидающих очереди. Сверх этого — немедленный отказ (fail-fast).
+    LLM_MAX_WAITING: int = 4
+
+    # «Резервный мозг»: обучение и настройки LLM хранятся ВНЕ файла модели (переносимо между
+    # моделями) — writable-каталог, отдельный от read-only каталога моделей. См. modules/llm/brain.py.
+    LLM_BRAIN_DIR: str = "models/llm_brain"
+
+    # Часовой пояс расписания фоновых задач (ТЗ v18 п.10: еженедельная самооценка LLM).
+    # Задаётся отдельно от системного времени контейнера: расписание согласуется с рабочими
+    # часами банка, а не с настройками образа.
+    SCHEDULE_TIMEZONE: str = "Europe/Moscow"
+
+    @property
+    def LLM_MODEL_PATH(self) -> str:
+        """Явно сконфигурированный путь (для обратной совместимости). Фактически загружаемый файл
+        определяет service.discover_model_path() с учётом режима "auto"."""
+        name = self.LOCAL_LLM_MODEL_FILE if self.LOCAL_LLM_MODEL_FILE not in ("", "auto", "AUTO") else "asok-model.gguf"
+        return os.path.join(self.LOCAL_LLM_MODEL_DIR, name)
+
+    # Внешние интеграции (ТЗ v13 §B5): пустой URL = интеграция выключена (работает заглушка).
+    # Реальные адаптеры (фаза 4+) читают эндпоинты/токены ТОЛЬКО отсюда (env), не из кода.
+    KMS_API_URL: str = ""     # СУЗ (система управления знаниями)
+    KMS_API_TOKEN: str = ""
+    TMS_API_URL: str = ""     # ТМС (управление тестированием)
+    TMS_API_TOKEN: str = ""
+    ITSM_API_URL: str = ""    # ITSM (инциденты/проблемы/изменения)
+    ITSM_API_TOKEN: str = ""
+    DWH_URL: str = ""         # Хранилище данных (приём сырья + выгрузка анализа)
+    DWH_TOKEN: str = ""
+    # ТЗ v19 п.6: канал уведомлений НЕ выбран заказчиком (решение сессии — «SMTP не определён,
+    # строить порт и заглушку»). Пустой хост = канал не настроен, работает StubNotificationPort
+    # (события пишутся в лог, не теряются молча). Реальный SMTP/мессенджер-клиент подключается
+    # сюда же по конфигурации, когда канал определится — домены (governance и т.д.) не меняются.
+    NOTIFICATION_SMTP_HOST: str = ""
+    NOTIFICATION_FROM_ADDRESS: str = ""
+    # ТЗ v19 п.6: интеграция с внешним таск-трекером — решение сессии «не сейчас» (внутренний
+    # Гант уже закрывает потребность). Пустой URL = заглушка, как у соседних интеграций выше.
+    TASK_SYNC_API_URL: str = ""
+    TASK_SYNC_API_TOKEN: str = ""
+
+    # CORS (ИБ-14): явный список origin. Фронт штатно ходит на тот же origin через прокси (Vite/nginx),
+    # сюда добавляется только отдельно размещённый фронт, например ["https://asok.asokis.ai"].
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+    # Режимы
+    # DEMO_MODE — демо-стенд: стартовый сид демо-набора, сценарные системы, моки, встроенные
+    # демо-учётки (iam/demo_users.py). ИБ-02: по умолчанию ВЫКЛЮЧЕН — забытая переменная окружения
+    # даёт продуктивный режим (fail-fast на небезопасных секретах), а не открытый демо-вход.
+    # Демо-стенд включает его явно: `.env` или оверлей docker-compose.demo.yml.
+    DEMO_MODE: bool = False
+    # DEMO_AUTH_BYPASS — отдельный, НАМЕРЕННО опасный флаг: запрос БЕЗ заголовка Authorization
+    # обслуживается как встроенный пользователь `demo` с ролью ADMIN. Нужен для показа стенда
+    # без логина. По умолчанию ВЫКЛЮЧЕН.
+    #
+    # Раньше обход был зашит в DEMO_MODE (по умолчанию true), и под него попадал не только
+    # отсутствующий, но и НЕВАЛИДНЫЙ токен: подделанная подпись молча повышалась до ADMIN.
+    # Стенд публикуется наружу туннелем, поэтому любой, кто знал адрес, получал администратора.
+    # Теперь просроченный/подделанный токен — всегда 401, независимо от режима.
+    # ИБ-02: действует только вместе с DEMO_MODE; в продуктиве (DEMO_MODE=false) включённый флаг —
+    # запрет старта (security_issues).
+    DEMO_AUTH_BYPASS: bool = False
+
+    # ИБ-07 (SEC-12, docs/SECURITY_AUDIT_RF_2026-09-08.md): /docs и /openapi.json отдают анониму
+    # полную карту 171 эндпоинта и схемы данных. По умолчанию открыты (как и раньше) — это
+    # удобно для локальной разработки и не поднимает риск само по себе, пока стенд не
+    # опубликован наружу. ПЕРЕД показом по публичной ссылке (профили tunnel/tunnel-named/
+    # tunnel-ngrok/webserver, см. docker-compose.yml) — выставить API_DOCS_ENABLED=false
+    # в .env перед запуском туннеля (см. чек-лист в docs/REMOTE_ACCESS.md). Автоматической
+    # привязки к профилю нет: local-dev и публичный показ используют один и тот же
+    # docker-compose.override.yml, поэтому это осознанный ручной шаг, а не настройка по умолчанию.
+    API_DOCS_ENABLED: bool = True
+
+    # Загрузки
+    UPLOAD_DIR: str = "uploads"
+
+    _INSECURE_JWT_DEFAULT = "dev_secret_key_change_in_production_minimum_32_chars"
+    _INSECURE_DB_DEFAULTS = ("asok_pass123",)
+    _INSECURE_REDIS_DEFAULTS = ("asok_redis_dev",)
+
+    def _redis_has_password(self) -> bool:
+        from urllib.parse import urlparse
+
+        try:
+            return bool(urlparse(self.REDIS_URL).password)
+        except ValueError:
+            return False
+
+    def security_issues(self) -> list[str]:
+        """
+        Перечень проблем безопасности конфигурации (для старта приложения).
+        Учитывает требования к управлению секретами (ГОСТ Р 57580, 152-ФЗ).
+        """
+        issues: list[str] = []
+        if self.JWT_SECRET_KEY == self._INSECURE_JWT_DEFAULT:
+            issues.append("JWT_SECRET_KEY использует небезопасное значение по умолчанию")
+        if len(self.JWT_SECRET_KEY) < 32:
+            issues.append("JWT_SECRET_KEY короче 32 символов")
+        if any(d in self.DATABASE_URL for d in self._INSECURE_DB_DEFAULTS):
+            issues.append("DATABASE_URL содержит пароль по умолчанию")
+        if not self._redis_has_password():
+            issues.append("REDIS_URL без пароля (задайте REDIS_PASSWORD, ИБ-22)")
+        elif any(d in self.REDIS_URL for d in self._INSECURE_REDIS_DEFAULTS):
+            issues.append("REDIS_URL содержит пароль по умолчанию (задайте REDIS_PASSWORD, ИБ-22)")
+        if self.DEMO_AUTH_BYPASS:
+            issues.append(
+                "DEMO_AUTH_BYPASS включён: запросы без токена обслуживаются как ADMIN"
+            )
+        # ИБ-14: «*» вместе с allow_credentials — отдать учётные данные любому сайту.
+        if any(o.strip() == "*" for o in self.CORS_ORIGINS):
+            issues.append("CORS_ORIGINS содержит «*» — перечислите origin фронта явно (ИБ-14)")
+        return issues
+
+
+settings = Settings()

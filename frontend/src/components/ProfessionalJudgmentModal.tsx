@@ -1,0 +1,170 @@
+/**
+ * ProfessionalJudgmentModal.tsx — модал «Профессиональное суждение» менеджера по качеству.
+ * Реализует R2.3 / R2.4 / R2.5 ТЗ v9:
+ *  - обоснование (профессиональное суждение) по метрике/под-характеристике;
+ *  - опциональная постановка задачи: карточка риска + ответственный + срок;
+ *  - результат уходит топ-менеджменту как мера со статусом «ожидает одобрения»,
+ *    с явной формулировкой «что ожидается и почему».
+ */
+import React, { useEffect } from 'react';
+import { Modal, Form, Input, Checkbox, Select, DatePicker, Typography, Tag, Space } from 'antd';
+import { useSelector } from 'react-redux';
+import { useAppDispatch } from '../store/hooks';
+import dayjs from 'dayjs';
+import { addProposal } from '../store/slices/governanceSlice';
+import { RootState } from '../store';
+import { ragToken, levelLabel, solidTagStyle } from '../theme/ragPalette';
+import { TYPE } from '../theme/premium';
+import FieldHint from './FieldHint';
+
+const { TextArea } = Input;
+const { Text } = Typography;
+
+const LEVELS = [
+  'Высокий уровень',
+  'Выше среднего',
+  'Средний уровень',
+  'Ниже среднего',
+  'Низкий уровень',
+  'Невозможно измерить',
+];
+
+export interface JudgmentTarget {
+  systemName: string;
+  characteristic: string;
+  metricName: string;
+  score: number;
+}
+
+interface Props {
+  open: boolean;
+  target: JudgmentTarget | null;
+  onClose: () => void;
+}
+
+export const ProfessionalJudgmentModal: React.FC<Props> = ({ open, target, onClose }) => {
+  const [form] = Form.useForm();
+  const dispatch = useAppDispatch();
+  const fullName = useSelector((s: RootState) => s.auth.fullName) || 'Менеджер по качеству';
+  const createRisk = Form.useWatch('createRisk', form);
+
+  useEffect(() => {
+    if (open && target) {
+      form.setFieldsValue({
+        rationale: '',
+        createRisk: true,
+        riskTitle: `Снижение качества: ${target.characteristic}`,
+        owner: '',
+        ownerRole: '',
+        dueDate: null,
+        adjustedLevel: undefined,
+      });
+    }
+  }, [open, target, form]);
+
+  if (!target) return null;
+  const tok = ragToken(target.score);
+
+  const handleOk = async () => {
+    const v = await form.validateFields();
+    // Формулировка «что ожидается от ЛПР и почему» — для понятности топ-менеджменту (R2.5)
+    const expectation =
+      `Прошу одобрить меру по «${target.characteristic}» ИС «${target.systemName}». ` +
+      `Метрика «${target.metricName}» = ${target.score}% (${levelLabel(target.score)}). ` +
+      (v.createRisk
+        ? `Предлагается завести риск «${v.riskTitle}»${v.owner ? `, ответственный — ${v.owner}${v.ownerRole ? ` (${v.ownerRole})` : ''}` : ''}` +
+          `${v.dueDate ? `, срок — ${dayjs(v.dueDate).format('DD.MM.YYYY')}` : ''}.`
+        : 'Корректировка экспертной оценки без заведения риска.');
+
+    dispatch(
+      addProposal({
+        systemName: target.systemName,
+        characteristic: target.characteristic,
+        metricName: target.metricName,
+        calculatedScore: target.score,
+        calculatedLevel: levelLabel(target.score),
+        adjustedLevel: v.adjustedLevel,
+        rationale: v.rationale,
+        createRisk: !!v.createRisk,
+        riskTitle: v.createRisk ? v.riskTitle : undefined,
+        owner: v.createRisk ? v.owner : undefined,
+        ownerRole: v.createRisk ? v.ownerRole : undefined,
+        dueDate: v.createRisk && v.dueDate ? dayjs(v.dueDate).format('DD.MM.YYYY') : undefined,
+        expectation,
+        createdBy: fullName,
+      }),
+    );
+    form.resetFields();
+    onClose();
+  };
+
+  return (
+    <Modal
+      title="Профессиональное суждение"
+      open={open}
+      onOk={handleOk}
+      onCancel={onClose}
+      okText="Применить корректировку"
+      cancelText="Отмена"
+      width={520}
+      destroyOnClose
+    >
+      <Space direction="vertical" size={4} style={{ width: '100%', marginBottom: 12 }}>
+        <Text type="secondary">Метрика</Text>
+        <Space>
+          <Text strong>{target.metricName}</Text>
+          <Tag style={solidTagStyle(tok.strong)}>
+            {target.score}% · {tok.label}
+          </Tag>
+        </Space>
+        <Text type="secondary" style={{ fontSize: TYPE.caption.fontSize }}>
+          {target.systemName} · {target.characteristic}
+        </Text>
+      </Space>
+
+      <Form form={form} layout="vertical" requiredMark={false}>
+        <Form.Item
+          name="rationale"
+          label={<FieldHint title="Почему вы вносите это профессиональное суждение: факт → причина → влияние на качество. Минимум 10 символов, уходит топ-менеджменту вместе с мерой.">Комментарий (обоснование)</FieldHint>}
+          rules={[{ required: true, min: 10, message: 'Укажите обоснование не короче 10 символов' }]}
+        >
+          <TextArea
+            rows={3}
+            placeholder="Напр.: недостаточно ресурса автотестеров для автоматизации тест-кейсов регрессионной модели…"
+          />
+        </Form.Item>
+
+        <Form.Item name="adjustedLevel" label={<FieldHint title="Заполняйте, только если экспертно не согласны с расчётным уровнем метрики. Пусто — уровень остаётся расчётным.">Ручная корректировка уровня (необязательно)</FieldHint>}>
+          <Select allowClear placeholder="Оставить расчётный уровень" options={LEVELS.map((l) => ({ value: l, label: l }))} />
+        </Form.Item>
+
+        <Form.Item name="createRisk" valuePropName="checked" style={{ marginBottom: createRisk ? 8 : 0 }}>
+          <Checkbox>Создать карточку риска (постановка задачи)</Checkbox>
+        </Form.Item>
+
+        {createRisk && (
+          <>
+            <Form.Item name="riskTitle" label={<FieldHint title="Краткая формулировка риска, к которому приведёт текущая просадка, если её не устранить.">Риск</FieldHint>} rules={[{ required: true, message: 'Укажите формулировку риска' }]}>
+              <Input placeholder="Напр.: Нарушение непрерывности предоставления данных" />
+            </Form.Item>
+            <Form.Item name="owner" label={<FieldHint title="Кто будет исполнять меру по этому риску — попадёт в «Мои задачи» этого сотрудника и в карточку «Эффективность сотрудников».">Ответственный (ФИО)</FieldHint>} rules={[{ required: true, message: 'Укажите ответственного' }]}>
+              <Input placeholder="Иванов И.И." />
+            </Form.Item>
+            <Form.Item name="ownerRole" label={<FieldHint title="Должность ответственного — для контекста топ-менеджменту при одобрении меры.">Должность ответственного</FieldHint>} rules={[{ required: true, message: 'Укажите должность' }]}>
+              <Input placeholder="Напр.: Руководитель ИТ-блока" />
+            </Form.Item>
+            <Form.Item name="dueDate" label={<FieldHint title="Плановый срок исполнения меры. Необязательно, но без срока задача не попадёт на диаграмму Ганта в «Плане задач».">Срок</FieldHint>}>
+              <DatePicker format="DD.MM.YYYY" style={{ width: '100%' }} />
+            </Form.Item>
+          </>
+        )}
+      </Form>
+
+      <Text type="secondary" style={{ fontSize: TYPE.caption.fontSize }}>
+        После применения мера уйдёт топ-менеджменту со статусом «ожидает одобрения».
+      </Text>
+    </Modal>
+  );
+};
+
+export default ProfessionalJudgmentModal;

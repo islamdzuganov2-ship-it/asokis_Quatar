@@ -1,0 +1,185 @@
+name: asok-is
+
+services:
+
+  postgres:
+    # pgvector/pgvector:pg14 = официальный PostgreSQL 14 + расширение vector (T-20, семантический
+    # поиск базы рисков). Формат данных PG14 идентичен postgres:14-alpine → том pgdata переносится
+    # без потерь. Само расширение включается миграцией 012 (CREATE EXTENSION vector).
+    image: pgvector/pgvector:pg14
+    container_name: asok_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: asok_is
+      POSTGRES_USER: asok_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-asok_pass123}
+    # ИБ-05a (SEC-10, docs/SECURITY_AUDIT_RF_2026-09-08.md): порт на хост НЕ публикуется.
+    # backend/celery_worker достают postgres по имени сервиса внутри сети asok_net — им
+    # `ports:` не нужен, он открывает БД наружу (в т.ч. в интернет при любом из профилей
+    # публикации демо-оверлея docker-compose.demo.yml, ИБ-06). Нужен временный доступ с хоста
+    # (DB GUI) — `docker compose exec postgres psql -U asok_user asok_is`, либо личный,
+    # НЕ коммитимый оверлей (docker-compose -f docker-compose.yml -f docker-compose.override.yml
+    # -f docker-compose.local.yml up), а не правка этого файла или отслеживаемого override.yml.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asok_user -d asok_is"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - asok_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: asok_redis
+    restart: unless-stopped
+    # ИБ-05a (SEC-10): порт на хост не публикуется — та же логика, что у postgres выше.
+    # ИБ-Ф1 (пароль Redis, часть ИБ-05/ИБ-22): requirepass. Без пароля любой процесс в сети
+    # asok_net (или с хоста при случайно открытом порте) пишет в Redis — а там теперь список
+    # отозванных токенов и счётчики анти-брутфорса (ИБ-10/ИБ-12): сброс этих ключей = снятие
+    # блокировки подбора и «оживление» отозванных сессий. Пароль — REDIS_PASSWORD в .env;
+    # значение по умолчанию — только для локального стенда: при DEMO_MODE=false бэкенд с ним
+    # не стартует (config.security_issues).
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-asok_redis_dev}", "--protected-mode", "yes"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-asok_redis_dev}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      # REDISCLI_AUTH выше — redis-cli берёт пароль из окружения, не из командной строки.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - asok_net
+
+  backend:
+    # Явный dockerfile (строчными): на регистрозависимой ФС Linux сокращённая форма
+    # `build: ./backend` искала бы `Dockerfile` и падала бы «Dockerfile not found».
+    build:
+      context: ./backend
+      dockerfile: dockerfile
+    container_name: asok_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://asok_user:${POSTGRES_PASSWORD:-asok_pass123}@postgres:5432/asok_is
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-asok_redis_dev}@redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./models/llm:/app/models/llm:ro
+      # «Резервный мозг» LLM — WRITABLE (память/корпус/фидбэк вне файла модели, переносимо
+      # между моделями). Отдельный том от read-only каталога моделей. См. modules/llm/brain.py.
+      - ./models/llm_brain:/app/models/llm_brain
+      # Манифест развёртывания — read-only: tests/test_resource_limits.py читает его как
+      # данные и стережёт RES-01/02/08 там же, где гоняется остальной регресс.
+      - ./docker-compose.yml:/deploy/docker-compose.yml:ro
+      # Excel-файлы отвязаны от сборки: автосид опционален и пропускается, если файлов нет
+      # (seed_project_excel_files проверяет .exists()). Загрузка Excel пользователем — отдельная фича.
+      - /app/__pycache__
+    # RES-08: БЕЗ --reload. Reloader держит второй процесс и перезапускает воркер на любое
+    # изменение файла — вместе с ним заново грузятся ~7 ГБ весов модели (замер: первый запрос
+    # после старта ждал ~10 минут). Именно это выглядело как «утечка памяти». Для разработки
+    # --reload включается в docker-compose.override.yml.
+    # ДЕФ-03/БТ-507: схема БД создаётся ИСКЛЮЧИТЕЛЬНО миграциями. Раньше alembic не
+    # вызывался вовсе, а create_all работал только под DEMO_MODE — в продуктиве схемы
+    # не было вообще. migrate.py умеет принять уже существующую схему (stamp head).
+    command: sh -c "python -m app.scripts.migrate && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    # RES-01: потолок ресурсов. Резидентные веса — 6.2 ГиБ при 7.7 ГиБ RAM хоста; без лимита
+    # OOM-killer выбирает жертву на всём хосте, включая PostgreSQL.
+    deploy:
+      resources:
+        limits:
+          memory: 7000M
+          cpus: "6"
+    networks:
+      - asok_net
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: dockerfile
+    container_name: asok_celery
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://asok_user:${POSTGRES_PASSWORD:-asok_pass123}@postgres:5432/asok_is
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-asok_redis_dev}@redis:6379/0
+      # RES-02: воркер НЕ грузит веса. modules/llm/tasks.py использует тот же in-process
+      # llama.cpp; при --concurrency=2 это две копии весов сверх копии бэкенда.
+      - LLM_ENABLED=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./models/llm:/app/models/llm:ro
+      # «Резервный мозг» LLM — WRITABLE (общий с backend; воркер тоже пишет память рассуждений).
+      - ./models/llm_brain:/app/models/llm_brain
+      - ./docker-compose.yml:/deploy/docker-compose.yml:ro
+      - /app/__pycache__
+    # --beat: планировщик встроен в воркер (еженедельная самооценка LLM, ТЗ v18 п.10).
+    # Отдельный контейнер beat не поднимаем: воркер в стенде один. При масштабировании
+    # на несколько воркеров beat обязан стать отдельным процессом — иначе расписание
+    # сработает столько раз, сколько воркеров запущено. См. infrastructure/workers.py.
+    # Расписание beat хранится в /tmp (файл celerybeat-schedule), том не требуется:
+    # при перезапуске задача просто отработает в следующий назначенный срок.
+    command: celery -A app.workers.tasks.celery_app worker --beat --schedule=/tmp/celerybeat-schedule --loglevel=info --concurrency=2
+    # RES-01: потолок ресурсов воркера. Модель он не грузит (LLM_ENABLED=false выше),
+    # поэтому лимит скромный; cpus согласован с --concurrency=2.
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "2"
+    # У воркера нет HTTP-порта, поэтому unhealthy-проверка из Dockerfile (curl :8000) всегда
+    # падала. Проверяем готовность брокера/воркера через celery inspect ping.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.tasks.celery_app inspect ping -t 10 | grep -q pong || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    networks:
+      - asok_net
+
+  frontend:
+    # ИБ-04 (SEC-04): прод-раздача — статическая сборка Vite под nginx (frontend/dockerfile.prod):
+    # без dev-сервера, исходников и sourcemap в контейнере; /api nginx проксирует на бэкенд
+    # (один origin, без CORS). Dev-сервер Vite с HMR — оверлей docker-compose.demo.yml.
+    build:
+      context: ./frontend
+      dockerfile: dockerfile.prod
+      args:
+        VITE_API_BASE_URL: /api/v1
+    # Явный тег: прод- и dev-образ фронта не подменяют друг друга при смене оверлея.
+    image: asok-is-frontend:prod
+    container_name: asok_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - asok_net
+
+networks:
+  asok_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

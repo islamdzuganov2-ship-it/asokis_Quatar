@@ -1,0 +1,235 @@
+"""
+REST API рискового события (BL-007, RE-08/09) — /api/v1/risk-events.
+
+Числовой контур риска (ARO/ALE), отдельно от /risks (база знаний). RBAC: реестр рисков ведёт
+владелец риска (RISK_MANAGER) / админ (§6.1: риск-менеджер видит весь портфель, но НЕ меняет
+Score — это в контуре оценки). Чтение — по праву `view.risk_economics` либо `view.dashboard.risk`;
+чисто денежные срезы (`/heatmap-money-layer`, `/chain`, `/portfolio-summary`) — только по
+`view.risk_economics`. Формулировка «чтение всем аутентифицированным» действовала до ДЕФ-42
+(2026-09-07): она давала роли EXECUTOR портфельный ALE вопреки §17.8/УК-58.
+"""
+from __future__ import annotations
+
+import uuid
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.database import get_db
+from app.modules.iam import get_current_user, require_permission
+from app.modules.risk import event_service as service
+from app.modules.risk import execution_control
+from app.shared.filters import parse_str_list, parse_uuid_list
+from app.modules.risk.event_schemas import (
+    AleResultOut,
+    HeatmapCellDetailOut,
+    HeatmapMoneyCellOut,
+    IncidentLinkIn,
+    IncidentLinkOut,
+    MeasureLinkIn,
+    MeasureLinkOut,
+    PortfolioRiskSummaryOut,
+    RiskEventCreate,
+    RiskEventLinksOut,
+    RiskEventOut,
+    RiskEventUpdate,
+    RiskMeasureChainRowOut,
+    SubcharLinkIn,
+    SubcharLinkOut,
+)
+
+router = APIRouter()
+
+RISK_ROLES = ("RISK_MANAGER", "ADMIN")  # владелец риска ведёт реестр (SoD §6.1)
+
+
+@router.get("", response_model=list[RiskEventOut])
+async def list_events(
+    status: str = "active",
+    system_id: uuid.UUID | None = None,
+    category: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risk_economics", "view.dashboard.risk")),
+) -> list:
+    return await service.list_events(db, status=status, system_id=system_id, category=category)
+
+
+@router.post("", response_model=RiskEventOut, status_code=201)
+async def create_event(
+    payload: RiskEventCreate,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_permission("risk.register.edit")),
+):
+    return await service.create_event(db, payload, user.get("username"))
+
+
+# ТЗ v19 §17.2 (УК-45): двойной контроль исполнения — сверка исполненных мер со сбоями.
+# Литеральный путь ДО /{event_id}, как /by-cell ниже.
+@router.get("/execution-mismatches", response_model=list[execution_control.ExecutionMismatchOut])
+async def get_execution_mismatches(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("governance.propose", "view.risk_economics")),
+):
+    """Меры, отмеченные исполненными, по которым сбои продолжаются (сигнал, не решение)."""
+    return await execution_control.execution_mismatches(db)
+
+
+# ТЗ v19 п.4 (УК-10): связь ячейки теплокарты (ИС × характеристика) с рисками/мерами/деньгами. Путь
+# ДО /{event_id} — иначе FastAPI попытается разобрать «by-cell» как UUID события (порядок
+# регистрации маршрутов имеет значение для литеральных путей против path-параметров).
+@router.get("/by-cell", response_model=HeatmapCellDetailOut)
+async def get_cell_detail(
+    system_name: str,
+    characteristic: str,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risk_economics", "view.dashboard.risk")),
+):
+    return await service.cell_detail(db, system_name, characteristic)
+
+
+# УК-11: денежный слой всей теплокарты (переключатель балл/ALE/ΔALE/покрытие) — один запрос на
+# весь грид, тот же путь ДО /{event_id} по той же причине, что и /by-cell выше.
+@router.get("/heatmap-money-layer", response_model=list[HeatmapMoneyCellOut])
+async def get_heatmap_money_layer(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risk_economics")),
+):
+    return await service.heatmap_money_layer(db)
+
+
+# ТЗ v19 п.7 (УК-19/20): сквозная цепочка риск → мера → эффект + портфельный итог — литеральные
+# пути ДО /{event_id} по той же причине, что /by-cell и /heatmap-money-layer выше.
+@router.get("/chain", response_model=list[RiskMeasureChainRowOut])
+async def get_risk_measure_chain(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risk_economics")),
+):
+    return await service.risk_measure_chain(db)
+
+
+@router.get("/portfolio-summary", response_model=PortfolioRiskSummaryOut)
+async def get_portfolio_risk_summary(
+    system_id: str | None = None,
+    criticality: str | None = None,
+    characteristic: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risk_economics")),
+):
+    return await service.portfolio_risk_summary(
+        db, system_id=parse_uuid_list(system_id), criticality=parse_str_list(criticality),
+        characteristic=characteristic,
+    )
+
+
+@router.get("/{event_id}", response_model=RiskEventOut)
+async def get_event(
+    event_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risk_economics", "view.dashboard.risk")),
+):
+    return await service.get_or_404(db, event_id)
+
+
+@router.patch("/{event_id}", response_model=RiskEventOut)
+async def update_event(
+    event_id: uuid.UUID,
+    payload: RiskEventUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    ev = await service.get_or_404(db, event_id)
+    return await service.update_event(db, ev, payload)
+
+
+# Карточка взаимосвязи ТС-мера-экономика-качество (БТ-322): все связи риска одним запросом.
+@router.get("/{event_id}/links", response_model=RiskEventLinksOut)
+async def get_event_links(
+    event_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("view.risk_economics", "view.dashboard.risk")),
+):
+    return await service.get_links(db, event_id)
+
+
+@router.post("/{event_id}/archive", response_model=RiskEventOut)
+async def archive_event(
+    event_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    ev = await service.get_or_404(db, event_id)
+    return await service.archive_event(db, ev)
+
+
+# ── Связи ──
+
+@router.post("/{event_id}/subchars", response_model=SubcharLinkOut, status_code=201)
+async def link_subchar(
+    event_id: uuid.UUID,
+    payload: SubcharLinkIn,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    return await service.link_subchar(db, event_id, payload)
+
+
+@router.post("/{event_id}/incidents", response_model=IncidentLinkOut, status_code=201)
+async def link_incident(
+    event_id: uuid.UUID,
+    payload: IncidentLinkIn,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    return await service.link_incident(db, event_id, payload.incident_id)
+
+
+@router.post("/{event_id}/measures", response_model=MeasureLinkOut, status_code=201)
+async def link_measure(
+    event_id: uuid.UUID,
+    payload: MeasureLinkIn,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    return await service.link_measure(db, event_id, payload)
+
+
+@router.delete("/{event_id}/subchars/{link_id}", status_code=204)
+async def unlink_subchar(
+    event_id: uuid.UUID,
+    link_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    await service.unlink_subchar(db, event_id, link_id)
+
+
+@router.delete("/{event_id}/incidents/{link_id}", status_code=204)
+async def unlink_incident(
+    event_id: uuid.UUID,
+    link_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    await service.unlink_incident(db, event_id, link_id)
+
+
+@router.delete("/{event_id}/measures/{link_id}", status_code=204)
+async def unlink_measure(
+    event_id: uuid.UUID,
+    link_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    await service.unlink_measure(db, event_id, link_id)
+
+
+# ── Пересчёт ALE (RE-09) ──
+
+@router.post("/{event_id}/recompute-ale", response_model=AleResultOut)
+async def recompute_ale(
+    event_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_permission("risk.register.edit")),
+):
+    ev = await service.get_or_404(db, event_id)
+    return await service.recompute_ale(db, ev)

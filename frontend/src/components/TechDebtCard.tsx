@@ -1,0 +1,163 @@
+/**
+ * TechDebtCard.tsx — статус технического долга по мерам качества.
+ *
+ * Компактный, читаемый на узких экранах вид: фильтр периода — отдельной строкой под
+ * заголовком (не конкурирует с названием); счётчики статусов — списком строк
+ * «цвет · подпись · число» (кликабельны, открывают список мер). Сверху — два burndown.
+ */
+import React, { useMemo, useState } from 'react';
+import { Card, Modal, Progress, Select, Space, Table, Tag, Typography } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
+import { FundOutlined } from '@ant-design/icons';
+import type { Proposal } from '../store/slices/governanceSlice';
+import { BRAND, RAG, ragToken, solidTagStyle, ACCENT } from '../theme/ragPalette';
+import { premiumCard, accentDot, GOLD, TYPE, SPACE } from '../theme/premium';
+import { numericColumn, sorterFor } from '../theme/table';
+import { parseRuDate } from '../utils/dates';
+import { OwnerLink } from './OwnerLink';
+
+const { Text } = Typography;
+const TODAY = new Date(2026, 5, 26).getTime();
+
+function parseDue(d?: string): Date | null {
+  if (!d) return null;
+  const m = d.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  return m ? new Date(+m[3], +m[2] - 1, +m[1]) : null;
+}
+
+type Bucket = 'pending' | 'awaiting' | 'done' | 'overdue';
+
+const STATUS_ROWS: { b: Bucket; label: string; color: string }[] = [
+  { b: 'pending', label: 'Ожидают решения', color: RAG.medium.color },
+  { b: 'awaiting', label: 'Одобрены, ждут выполнения', color: ACCENT.slate.color },
+  { b: 'done', label: 'Выполнено', color: RAG.good.color },
+  { b: 'overdue', label: 'Просрочено / не выполнено', color: RAG.bad.color },
+];
+const BUCKET_TITLE: Record<Bucket, string> = Object.fromEntries(
+  STATUS_ROWS.map((r) => [r.b, r.label]),
+) as Record<Bucket, string>;
+
+interface Props {
+  proposals: Proposal[];
+  onOpenMeasure?: (p: Proposal) => void;
+}
+
+export const TechDebtCard: React.FC<Props> = ({ proposals, onOpenMeasure }) => {
+  const [year, setYear] = useState<string | undefined>();
+  const [quarter, setQuarter] = useState<number | undefined>();
+  const [detail, setDetail] = useState<Bucket | null>(null);
+
+  const years = useMemo(() => {
+    const ys = new Set<number>();
+    proposals.forEach((p) => { const d = parseDue(p.dueDate); if (d) ys.add(d.getFullYear()); });
+    return [...ys].sort();
+  }, [proposals]);
+
+  const filtered = useMemo(() => proposals.filter((p) => {
+    if (!year && !quarter) return true;
+    const d = parseDue(p.dueDate);
+    if (!d) return false;
+    if (year && String(d.getFullYear()) !== year) return false;
+    if (quarter && Math.floor(d.getMonth() / 3) + 1 !== quarter) return false;
+    return true;
+  }), [proposals, year, quarter]);
+
+  const lists: Record<Bucket, Proposal[]> = useMemo(() => {
+    const approved = filtered.filter((p) => p.status === 'APPROVED');
+    return {
+      pending: filtered.filter((p) => p.status === 'PENDING_APPROVAL'),
+      awaiting: approved.filter((p) => !p.execution),
+      done: approved.filter((p) => p.execution === 'DONE'),
+      overdue: approved.filter((p) =>
+        p.execution === 'NOT_DONE' || (!p.execution && (parseDue(p.dueDate)?.getTime() ?? Infinity) < TODAY)),
+    };
+  }, [filtered]);
+
+  const approvedCount = filtered.filter((p) => p.status === 'APPROVED').length;
+  const donePct = approvedCount ? Math.round((lists.done.length / approvedCount) * 100) : 0;
+  const totalActionable = lists.pending.length + approvedCount;
+  const resolvedPct = totalActionable ? Math.round((lists.done.length / totalActionable) * 100) : 0;
+
+  const detailColumns: ColumnsType<Proposal> = [
+    { title: 'Мера', dataIndex: 'riskTitle', sorter: sorterFor((r: Proposal) => r.riskTitle || r.metricName),
+      render: (v: string, r) => v || r.metricName },
+    { title: 'ИС', dataIndex: 'systemName', width: 170, sorter: sorterFor((r: Proposal) => r.systemName) },
+    numericColumn<Proposal>({ title: '%', dataIndex: 'calculatedScore', width: 64,
+      sorter: sorterFor((r: Proposal) => r.calculatedScore),
+      render: (v: number) => <Tag style={solidTagStyle(ragToken(v).strong)}>{v}%</Tag> }),
+    { title: 'Срок', dataIndex: 'dueDate', width: 104,
+      sorter: sorterFor((r: Proposal) => parseRuDate(r.dueDate)?.getTime() ?? null) },
+    { title: 'Ответственный', dataIndex: 'owner', width: 160, sorter: sorterFor((r: Proposal) => r.owner),
+      render: (v?: string) => <OwnerLink owner={v} /> },
+  ];
+
+  const barText: React.CSSProperties = { fontSize: TYPE.caption.fontSize, color: BRAND.inkSoft };
+
+  return (
+    <Card
+      title={<span style={{ color: BRAND.ink }}><span style={accentDot(GOLD.base)} /><FundOutlined /> Статус технического долга</span>}
+      {...premiumCard('gold')}
+      style={{ ...premiumCard('gold').style, height: '100%' }}
+    >
+      {/* Период — отдельной строкой под заголовком, не конкурирует с названием */}
+      <Space size={SPACE.snug} style={{ marginBottom: SPACE.base }}>
+        <Text type="secondary" style={{ fontSize: TYPE.caption.fontSize }}>Период:</Text>
+        <Select allowClear placeholder="Год" size="small" style={{ width: 92 }} value={year} onChange={setYear}
+          options={years.map((y) => ({ value: String(y), label: String(y) }))} />
+        <Select allowClear placeholder="Квартал" size="small" style={{ width: 104 }} value={quarter} onChange={setQuarter}
+          options={[1, 2, 3, 4].map((q) => ({ value: q, label: `Q${q}` }))} />
+      </Space>
+
+      <div style={barText}>Выполнено из одобренных мер</div>
+      <Progress percent={donePct} strokeColor={RAG.good.color} trailColor={BRAND.divider} />
+
+      <div style={barText}>Закрыто от всех мер в работе</div>
+      <Progress percent={resolvedPct} strokeColor={RAG.medium.color} trailColor={BRAND.divider} />
+
+      {/* Счётчики статусов — читаемым списком строк */}
+      <div style={{ marginTop: SPACE.cozy }}>
+        {STATUS_ROWS.map((r, i) => (
+          <div
+            key={r.b}
+            onClick={() => lists[r.b].length && setDetail(r.b)}
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: `${SPACE.snug}px ${SPACE.tight}px`, borderTop: i ? `1px solid ${BRAND.divider}` : 'none',
+              cursor: lists[r.b].length ? 'pointer' : 'default',
+            }}
+          >
+            <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <span style={{ width: 9, height: 9, borderRadius: '50%', background: r.color, flex: '0 0 auto' }} />
+              <Text style={{ fontSize: TYPE.bodySm.fontSize, color: BRAND.ink }}>{r.label}</Text>
+            </span>
+            <Text strong style={{ ...TYPE.metricSm, color: r.color, marginLeft: 8 }}>{lists[r.b].length}</Text>
+          </div>
+        ))}
+      </div>
+
+      <Modal
+        open={!!detail}
+        onCancel={() => setDetail(null)}
+        footer={null}
+        width={620}
+        title={detail ? `${BUCKET_TITLE[detail]} (${lists[detail].length})` : ''}
+      >
+        {detail && (
+          <Table<Proposal>
+            dataSource={lists[detail]}
+            rowKey="id"
+            size="small"
+            pagination={{ pageSize: 8, hideOnSinglePage: true }}
+            columns={detailColumns}
+            onRow={(rec) => ({
+              onClick: () => { onOpenMeasure?.(rec); setDetail(null); },
+              style: { cursor: onOpenMeasure ? 'pointer' : 'default' },
+            })}
+          />
+        )}
+      </Modal>
+    </Card>
+  );
+};
+
+export default TechDebtCard;

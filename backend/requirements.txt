@@ -1,0 +1,50 @@
+# backend/requirements.txt — ОЧИЩЕННЫЙ ВАРИАНТ
+# === Core ===
+fastapi==0.109.2
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# === Database ===
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+alembic==1.13.1
+psycopg2-binary==2.9.9
+# pgvector: тип Vector для SQLAlchemy + операторы косинуса (T-20, семантический поиск базы рисков).
+# Чистый Python (без torch/тяжёлых зависимостей); совместим с образом pgvector/pgvector:pg14.
+pgvector==0.3.6
+
+# === Security ===
+# ИБ-03 (SEC-02): python-jose 3.5.0 — CVE-2024-33663/33664 закрыты с 3.4.0; python-multipart 0.0.32 —
+# CVE-2024-24762/CVE-2024-53981 и последующие; fastapi 0.109.2 — выше 0.109.1 (CVE-2024-24762).
+# Минимальные пины без смены мажоров; Starlette <0.40 остаётся — ИБ-47 (обновление ветки FastAPI).
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-multipart==0.0.32
+
+# === Tasks & Cache ===
+celery==5.3.6
+redis==5.0.1
+
+# === Utilities ===
+httpx==0.26.0
+openpyxl==3.1.2
+pandas==2.2.0
+
+# === LLM (in-process, on-prem; читает ЛЮБОЙ *.gguf из models/llm/) ===
+# МОДЕЛЬ-АГНОСТИЧНО: рантайм 0.3.x грузит современные архитектуры (qwen2/qwen3, llama, gemma2,
+# phi3, mistral, stablelm и др.). Система сама опрашивает метаданные модели и адаптируется.
+# CPU-сборка ставится готовым wheel (без компиляции). GPU/CUDA — отдельный образ:
+# см. backend/dockerfile.cuda + docker-compose.gpu.yml (колесо с индекса cu124 или сборка из sdist).
+# NB: экзотический экспорт `qwen35` (Qwen3.5) может не грузиться и в 0.3.x — это свойство файла,
+# а не рантайма; mainstream-модели (в т.ч. Qwen3) загружаются.
+# Версия 0.3.19 имеет ГОТОВОЕ CPU-колесо на индексе abetlen (см. dockerfile: --only-binary),
+# поэтому образ собирается без компиляции llama.cpp (иначе сборка из sdist упирается в память).
+llama-cpp-python==0.3.19
+
+# === Dev (опционально для контейнера) ===
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+reportlab==5.0.0

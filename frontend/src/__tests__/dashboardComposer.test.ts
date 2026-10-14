@@ -1,0 +1,287 @@
+/**
+ * dashboardComposer.test.ts — инварианты конструктора дашбордов (ТЗ-22, КД-24).
+ *
+ * Проверяются две вещи, которые ломаются молча и потому опаснее всего:
+ *  1) слияние сохранённой раскладки с каталогом — карточка без права или выкинутая из релиза
+ *     не должна попасть на экран, а настройки формата v1 не должны потеряться;
+ *  2) перестановка пунктов меню — плоский порядок при трёх группах на экране.
+ *
+ * Каталог карточек сюда НЕ импортируется намеренно: он тянет за собой все модули карточек
+ * (antd, ECharts), а правила слияния к React отношения не имеют — справочник передаётся
+ * функцией `lookup` (см. layoutMath).
+ */
+import { describe, it, expect } from 'vitest';
+import {
+  layoutFromWidgets, sanitize, nextFreeRow, geometryOf, autoArrange, rowsOf, type CardMeta,
+} from '../dashboards/layoutMath';
+import { cardAllowed, GRID_COLS } from '../dashboards/types';
+import {
+  fullNavOrder, groupOfPerm, moveNavItem, normalizeNavGroups, NAV_GROUPS, type NavSection,
+} from '../constants/navOrderMath';
+
+// Мини-каталог: три карточки риск-дашборда и одна управленческая (доступна CTO ИЛИ CEO).
+const CARDS: Record<string, CardMeta> = {
+  'risk.kpi': { w: 12, h: 5, perm: 'view.dashboard.risk' },
+  'risk.triggers': { w: 6, h: 11, perm: 'view.dashboard.risk' },
+  'risk.topSystems': { w: 6, h: 11, perm: 'view.dashboard.risk' },
+  'exec.heatmap': { w: 8, h: 17, perm: ['view.dashboard.cto', 'view.dashboard.ceo'] },
+};
+const lookup = (id: string): CardMeta | undefined => CARDS[id];
+
+describe('раскладка дашборда: слияние с каталогом', () => {
+  it('legacy-формат v1 разворачивается в столбец, выключенные виджеты отброшены', () => {
+    const rows = layoutFromWidgets(
+      [
+        { id: 'triggers', enabled: true, order: 1 },
+        { id: 'kpi', enabled: true, order: 0 },
+        { id: 'topSystems', enabled: false, order: 2 },
+      ],
+      'risk',
+      lookup,
+    );
+    // Префикс дашборда достроен, порядок — по order, выключенный виджет не попал.
+    expect(rows.map((r) => r.i)).toEqual(['risk.kpi', 'risk.triggers']);
+    // Один столбец во всю ширину, вторая карточка начинается там, где кончилась первая.
+    expect(rows.every((r) => r.x === 0 && r.w === GRID_COLS)).toBe(true);
+    expect(rows[0].y).toBe(0);
+    expect(rows[1].y).toBe(CARDS['risk.kpi'].h);
+  });
+
+  it('виджет, которого больше нет в каталоге, не ломает конвертацию', () => {
+    const rows = layoutFromWidgets(
+      [
+        { id: 'kpi', enabled: true, order: 0 },
+        { id: 'убранныйВРелизе', enabled: true, order: 1 },
+      ],
+      'risk',
+      lookup,
+    );
+    expect(rows.map((r) => r.i)).toEqual(['risk.kpi']);
+  });
+
+  it('sanitize выкидывает карточки без права — RBAC остаётся верхней границей', () => {
+    const layout = [
+      { i: 'risk.kpi', x: 0, y: 0, w: 12, h: 5 },
+      { i: 'exec.heatmap', x: 0, y: 5, w: 8, h: 17 },
+    ];
+    const rows = sanitize(layout, ['view.dashboard.risk'], lookup);
+    expect(rows.map((r) => r.i)).toEqual(['risk.kpi']);
+  });
+
+  it('sanitize принимает карточку, если есть ЛЮБОЕ из перечисленных прав (CTO или CEO)', () => {
+    const layout = [{ i: 'exec.heatmap', x: 0, y: 0, w: 8, h: 17 }];
+    expect(sanitize(layout, ['view.dashboard.ceo'], lookup)).toHaveLength(1);
+    expect(sanitize(layout, ['view.dashboard.cto'], lookup)).toHaveLength(1);
+    expect(sanitize(layout, ['view.dashboard.manager'], lookup)).toHaveLength(0);
+  });
+
+  it('sanitize убирает дубли и неизвестные id', () => {
+    const layout = [
+      { i: 'risk.kpi', x: 0, y: 0, w: 12, h: 5 },
+      { i: 'risk.kpi', x: 0, y: 5, w: 12, h: 5 },
+      { i: 'нет.такой', x: 0, y: 10, w: 12, h: 5 },
+    ];
+    expect(sanitize(layout, ['view.dashboard.risk'], lookup).map((r) => r.i)).toEqual(['risk.kpi']);
+  });
+
+  it('новая карточка встаёт под всей раскладкой, а не поверх соседей', () => {
+    const layout = [
+      { i: 'risk.kpi', x: 0, y: 0, w: 12, h: 5 },
+      { i: 'risk.triggers', x: 0, y: 5, w: 6, h: 11 },
+    ];
+    expect(nextFreeRow(layout)).toBe(16);
+    expect(nextFreeRow([])).toBe(0);
+  });
+
+  it('в prefs пишется только геометрия — служебные поля react-grid-layout отбрасываются', () => {
+    const withNoise = [{ i: 'risk.kpi', x: 0, y: 0, w: 12, h: 5, static: false, moved: true } as any];
+    expect(geometryOf(withNoise)).toEqual([{ i: 'risk.kpi', x: 0, y: 0, w: 12, h: 5 }]);
+  });
+
+  it('cardAllowed: пустой список прав не открывает ничего', () => {
+    expect(cardAllowed({ perm: 'view.dashboard.risk' }, [])).toBe(false);
+    expect(cardAllowed({ perm: ['a', 'b'] }, ['b'])).toBe(true);
+  });
+});
+
+/** Пересекаются ли две карточки в 12-колоночной сетке (общая площадь по x и по y). */
+const overlaps = (a: { x: number; y: number; w: number; h: number }, b: typeof a): boolean =>
+  a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+
+describe('автовыравнивание карточек (skyline-упаковка)', () => {
+  it('не меняет w/h — только позицию', () => {
+    const layout = [
+      { i: 'a', x: 0, y: 20, w: 6, h: 5 },
+      { i: 'b', x: 6, y: 0, w: 4, h: 8 },
+    ];
+    const rows = autoArrange(layout);
+    expect(rows.find((r) => r.i === 'a')).toMatchObject({ w: 6, h: 5 });
+    expect(rows.find((r) => r.i === 'b')).toMatchObject({ w: 4, h: 8 });
+  });
+
+  it('карточки не накладываются друг на друга и не выходят за пределы 12 колонок', () => {
+    const layout = [
+      { i: 'a', x: 0, y: 0, w: 12, h: 5 },
+      { i: 'b', x: 0, y: 5, w: 6, h: 11 },
+      { i: 'c', x: 6, y: 5, w: 6, h: 8 },
+      { i: 'd', x: 0, y: 16, w: 4, h: 6 },
+      { i: 'e', x: 4, y: 16, w: 4, h: 6 },
+      { i: 'f', x: 8, y: 13, w: 4, h: 3 },
+    ];
+    const rows = autoArrange(layout);
+    rows.forEach((r) => {
+      expect(r.x).toBeGreaterThanOrEqual(0);
+      expect(r.x + r.w).toBeLessThanOrEqual(GRID_COLS);
+    });
+    for (let i = 0; i < rows.length; i += 1) {
+      for (let j = i + 1; j < rows.length; j += 1) {
+        expect(overlaps(rows[i], rows[j])).toBe(false);
+      }
+    }
+  });
+
+  it('плотнее (или так же плотно), чем было — по максимальной высоте раскладки', () => {
+    // Дыра между b и c: c можно было бы поднять на строку выше.
+    const layout = [
+      { i: 'a', x: 0, y: 0, w: 12, h: 4 },
+      { i: 'b', x: 0, y: 4, w: 6, h: 6 },
+      { i: 'c', x: 6, y: 6, w: 6, h: 6 },
+    ];
+    const before = layout.reduce((max, r) => Math.max(max, r.y + r.h), 0);
+    const rows = autoArrange(layout);
+    const after = rows.reduce((max, r) => Math.max(max, r.y + r.h), 0);
+    expect(after).toBeLessThanOrEqual(before);
+    // b и c (h=6) идут первыми как более высокие и встают рядом на первую строку,
+    // a (h=4) — под ними: итоговая высота 6 + 4 = 10 против исходных 4 + 6 = 10 с дырой сбоку.
+    expect(after).toBe(10);
+  });
+
+  it('уже плотная раскладка не меняется (идемпотентность результата)', () => {
+    const layout = [
+      { i: 'a', x: 0, y: 0, w: 6, h: 8 },
+      { i: 'b', x: 6, y: 0, w: 6, h: 8 },
+      { i: 'c', x: 0, y: 8, w: 12, h: 4 },
+    ];
+    const once = autoArrange(layout);
+    const twice = autoArrange(once);
+    expect(twice).toEqual(once);
+  });
+
+  it('пустая раскладка остаётся пустой', () => {
+    expect(autoArrange([])).toEqual([]);
+  });
+
+  it('возвращает карточки в исходном порядке массива — порядок значения не имеет, но так стабильнее сравнивать', () => {
+    const layout = [
+      { i: 'z', x: 0, y: 0, w: 6, h: 4 },
+      { i: 'a', x: 6, y: 0, w: 6, h: 4 },
+    ];
+    expect(autoArrange(layout).map((r) => r.i)).toEqual(['z', 'a']);
+  });
+});
+
+const SECTIONS: NavSection[] = [
+  { perm: 'my', group: 'Моя картина' },
+  { perm: 'cto', group: 'Моя картина' },
+  { perm: 'manager', group: 'Моя картина' },
+  { perm: 'incidents', group: 'Работа с данными' },
+  { perm: 'reports', group: 'Работа с данными' },
+  { perm: 'taskplan', group: 'Разрезы' },
+];
+
+describe('порядок пунктов левого меню', () => {
+  it('без пользовательского порядка сохраняется исходный', () => {
+    expect(fullNavOrder(SECTIONS, [])).toEqual(['my', 'cto', 'manager', 'incidents', 'reports', 'taskplan']);
+  });
+
+  it('разделы без сохранённого порядка идут ПОСЛЕ настроенных, между собой — в исходном порядке', () => {
+    // Пользователь настраивал меню, когда 'manager' и 'taskplan' ещё не существовали.
+    const order = fullNavOrder(SECTIONS, ['cto', 'my', 'incidents', 'reports']);
+    // Контракт ДЕФ-14: сохранённый порядок соблюдается дословно…
+    expect(order.slice(0, 4)).toEqual(['cto', 'my', 'incidents', 'reports']);
+    // …а новые разделы идут следом и между собой сохраняют порядок NAV_SECTIONS
+    // ('manager' объявлен раньше 'taskplan'), а не сыплются как попало.
+    expect(order.slice(4)).toEqual(['manager', 'taskplan']);
+  });
+
+  it('перетаскивание ставит пункт ПЕРЕД целевым', () => {
+    const { navOrder } = moveNavItem('taskplan', 'Моя картина', 'cto', SECTIONS, [], {});
+    expect(navOrder.indexOf('taskplan')).toBe(navOrder.indexOf('cto') - 1);
+  });
+
+  it('перенос в другую группу запоминается, возврат в родную — стирается', () => {
+    const moved = moveNavItem('taskplan', 'Моя картина', 'cto', SECTIONS, [], {});
+    expect(moved.navGroups.taskplan).toBe('Моя картина');
+    expect(groupOfPerm('taskplan', SECTIONS, moved.navGroups)).toBe('Моя картина');
+
+    // Возврат в штатную группу не пишет переопределение, равное дефолту, — оно удаляется.
+    const back = moveNavItem('taskplan', 'Разрезы', null, SECTIONS, moved.navOrder, moved.navGroups);
+    expect(back.navGroups).not.toHaveProperty('taskplan');
+    expect(groupOfPerm('taskplan', SECTIONS, back.navGroups)).toBe('Разрезы');
+  });
+
+  it('дроп на пустую область группы отправляет пункт в конец списка', () => {
+    const { navOrder } = moveNavItem('my', 'Разрезы', null, SECTIONS, [], {});
+    expect(navOrder[navOrder.length - 1]).toBe('my');
+  });
+
+  it('перестановка не теряет и не дублирует пункты', () => {
+    const { navOrder } = moveNavItem('reports', 'Моя картина', 'manager', SECTIONS, [], {});
+    expect([...navOrder].sort()).toEqual(SECTIONS.map((s) => s.perm).sort());
+  });
+});
+
+
+describe('перегруппировка меню по глубине (КП-37)', () => {
+  it('штатные группы — ровно три группы по глубине раскрытия', () => {
+    expect([...NAV_GROUPS]).toEqual(['Моя картина', 'Разрезы', 'Работа с данными']);
+  });
+
+  it('перенос, сохранённый под СТАРЫМ названием группы, переводится, а не теряет пункт', () => {
+    // Пользователь до релиза перенёс «План задач» в «Основное» — теперь это «Моя картина».
+    expect(groupOfPerm('taskplan', SECTIONS, { taskplan: 'Основное' })).toBe('Моя картина');
+    expect(normalizeNavGroups({ taskplan: 'Основное' }, SECTIONS)).toEqual({ taskplan: 'Моя картина' });
+  });
+
+  it('перенос в несуществующую группу отбрасывается — пункт возвращается в штатную', () => {
+    expect(groupOfPerm('reports', SECTIONS, { reports: 'Удалённая группа' })).toBe('Работа с данными');
+    expect(normalizeNavGroups({ reports: 'Удалённая группа' }, SECTIONS)).toEqual({});
+  });
+
+  it('старое название, совпавшее после перевода со штатной группой, удаляется как мусор', () => {
+    // «Отчёты» были перенесены в «Сбор и анализ данных» (= своя группа после перевода).
+    expect(normalizeNavGroups({ reports: 'Сбор и анализ данных' }, SECTIONS)).toEqual({});
+  });
+});
+
+describe('раскладка «N в ряд» (Р-14)', () => {
+  const H: Record<string, number> = { a: 8, b: 12, c: 8, d: 8, e: 5 };
+  const heightOf = (id: string) => H[id];
+
+  it('ряд занимает высоту самой высокой карточки — следующий ряд не наезжает', () => {
+    const rows = rowsOf(['a', 'b', 'c', 'd', 'e'], 3, heightOf);
+    const at = Object.fromEntries(rows.map((r) => [r.i, r]));
+    expect(at.a).toMatchObject({ x: 0, y: 0, w: 4, h: 8 });
+    expect(at.b).toMatchObject({ x: 4, y: 0, w: 4, h: 12 });
+    expect(at.c).toMatchObject({ x: 8, y: 0, w: 4, h: 8 });
+    // Второй ряд начинается под самой высокой (b, h=12), а не под «своей» высотой 8.
+    expect(at.d).toMatchObject({ x: 0, y: 12 });
+    expect(at.e).toMatchObject({ x: 4, y: 12, h: 5 });
+  });
+
+  it('ни одна пара карточек не пересекается при разновысоких плитках', () => {
+    const rows = rowsOf(['e', 'b', 'a', 'c', 'd'], 3, heightOf);
+    for (const p of rows) {
+      for (const q of rows) {
+        if (p.i === q.i) continue;
+        const overlap = p.x < q.x + q.w && q.x < p.x + p.w && p.y < q.y + q.h && q.y < p.y + p.h;
+        expect(overlap).toBe(false);
+      }
+    }
+  });
+
+  it('равновысокие плитки дают прежнюю раскладку (регресса для кокпитов нет)', () => {
+    const rows = rowsOf(['a', 'c', 'd', 'a2'], 3, () => 8);
+    expect(rows.map((r) => [r.x, r.y])).toEqual([[0, 0], [4, 0], [8, 0], [0, 8]]);
+  });
+});
